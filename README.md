@@ -97,7 +97,7 @@ ReconSH is entirely flag-driven. You must provide a target domain with `-d`.
 
 ReconSH organizes your loot cleanly into a target-specific directory:
 
-\`\`\`text
+```text
 recon_target.com/
 ├── subdomains/        # Raw & merged subdomain lists
 ├── ports/             # naabu port scan results
@@ -109,4 +109,4 @@ recon_target.com/
 ├── fuzzing/           # ffuf per-host JSON output
 ├── vulns/             # nuclei findings (text + JSONL)
 └── run_metadata.json  # Full execution metadata and asset counts
-\`\`\`
+```

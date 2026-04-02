@@ -33,7 +33,7 @@ ReconSH relies on industry-standard Go and Python tools. Ensure you have the fol
 * **Other:** `trufflehog` (v3), `jq`
 
 ### Quick Start
-\`\`\`bash
+```
 # 1. Clone the repository
 git clone https://github.com/0x-vartolu/ReconSH.git
 cd ReconSH
@@ -43,7 +43,7 @@ chmod +x recon.sh
 
 # 3. Configure webhooks (Optional)
 # Edit recon.sh and add your TELEGRAM_BOT_TOKEN or DISCORD_WEBHOOK_URL at the top of the file.
-\`\`\`
+```
 
 ---
 
@@ -51,9 +51,9 @@ chmod +x recon.sh
 
 ReconSH is entirely flag-driven. You must provide a target domain with `-d`.
 
-\`\`\`bash
+```
 ./recon.sh -d <domain> [MODULE FLAGS] [OPTIONS]
-\`\`\`
+```
 
 ### Module Flags:
 | Flag | Module Name | Description |
@@ -77,19 +77,19 @@ ReconSH is entirely flag-driven. You must provide a target domain with `-d`.
 ## 📖 Examples
 
 **1. Quick Passive Recon + Vuln Scan:**
-\`\`\`bash
+```
 ./recon.sh -d target.com -r -v
-\`\`\`
+```
 
 **2. Hunt for Secrets in JavaScript Files:**
-\`\`\`bash
+```
 ./recon.sh -d target.com -r -u -j
-\`\`\`
+```
 
 **3. The Full Bug Bounty Pipeline:**
-\`\`\`bash
+```
 ./recon.sh -d target.com -a -l /path/to/wordlists/raft-large.txt -n
-\`\`\`
+```
 
 ---
 

@@ -10,36 +10,43 @@
 #
 #  Tier-1 Bug Bounty Reconnaissance Orchestration Framework
 #  ─────────────────────────────────────────────────────────
-#  Version  : 3.0.0
+#  Version  : 4.0.0
 #  Author   : 0x-vartolu
 #  License  : MIT
 #
 #  DESCRIPTION:
 #    A modular, flag-driven, enterprise-grade reconnaissance pipeline for
-#    professional bug bounty hunting. Features port scanning, historical URL
-#    discovery, JS secret analysis, hidden parameter discovery, state
-#    tracking / resume capability, visual spinners, rich webhook embeds,
-#    and a full run metadata report.
+#    professional bug bounty hunting. Integrates 30+ specialised tools across
+#    passive enumeration, active bruteforcing, URL harvesting, JS secret
+#    analysis, vhost fuzzing, directory bruteforcing, port scanning, and
+#    hidden parameter discovery. Features state tracking / resume capability,
+#    visual spinners, rich webhook embeds (Telegram + Discord), and a full
+#    run metadata JSON report.
 #
 #  FULL MODULE FLAGS:
-#    -r   Passive Recon        Subdomain enum → dedup → live host filter
-#    -P   Port Scan            naabu port scan → feed into httpx (non-std ports)
-#    -s   Screenshots          gowitness visual recon on alive hosts
-#    -f   Fuzzing              ffuf active directory/param fuzzing (needs -l)
-#    -u   URL Discovery        gau/waybackurls historical URL harvest
-#    -j   JS & Secrets         JS extraction → trufflehog / nuclei secrets scan
-#    -p   Hidden Params        arjun hidden GET/POST parameter discovery
-#    -v   Vuln Scan            nuclei CVE/takeover/misconfig scanning
-#    -a   All Modules          Full pipeline in dependency order
+#    -r   Passive + Active Recon   Multi-source subdomain enum → dedup → httpx
+#    -P   Port Scan                naabu (all ports) + nmap service scan
+#    -s   Screenshots              gowitness visual recon on alive hosts
+#    -f   Fuzzing                  ffuf dir/vhost fuzzing + feroxbuster (needs -l)
+#    -u   URL Discovery            10-source URL harvest → category filtering
+#    -j   JS & Secrets             subjs/mantra/jsecret/jsleak + trufflehog
+#    -p   Hidden Params            arjun GET/POST + qsreplace FUZZ list
+#    -v   Vuln Scan                nuclei CVE/takeover/misconfig/exposure scanning
+#    -a   All Modules              Full pipeline in dependency order
 #
 #  USAGE:
 #    ./recon.sh -d target.com -r -P                      # Recon + port scan
 #    ./recon.sh -d target.com -r -u -j                   # Recon + URL + secrets
 #    ./recon.sh -d target.com -a -l wordlist.txt -n      # Full pipeline + notify
+#
+#  ENVIRONMENT VARIABLES (optional, loaded automatically if exported):
+#    PDCP_API_KEY     ProjectDiscovery chaos tool API key
+#    GITHUB_TOKEN     GitHub personal access token (for github-subdomains)
+#    NUCLEI_TEMPLATES Path to local nuclei-templates directory
 # ==============================================================================
 
-set -euo pipefail   # Exit on error | undefined vars | pipe failures
-IFS=$'\n\t'         # Safer word splitting (tabs & newlines only)
+set -uo pipefail   # Undefined vars are errors; pipe failures propagate
+IFS=$'\n\t'        # Safer word splitting
 
 # ══════════════════════════════════════════════════════════════════════════════
 # §1 ─ ANSI COLOUR PALETTE & LOGGING PREFIXES
@@ -65,7 +72,7 @@ readonly C_BMAGENTA='\033[1;35m'
 readonly C_BCYAN='\033[1;36m'
 readonly C_BWHITE='\033[1;37m'
 
-# Semantic logging prefixes (visual glyph + colour)
+# Semantic logging prefixes
 readonly LOG_OK="${C_BGREEN}[+]${C_RESET}"
 readonly LOG_INFO="${C_BCYAN}[*]${C_RESET}"
 readonly LOG_WARN="${C_BYELLOW}[~]${C_RESET}"
@@ -78,17 +85,17 @@ readonly LOG_SEP="${C_BLUE}$(printf '%0.s─' {1..72})${C_RESET}"
 # ══════════════════════════════════════════════════════════════════════════════
 
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="4.0.0"
 readonly SCRIPT_AUTHOR="0x-vartolu"
-readonly RUN_START_TS="$(date +%s)"          # Unix epoch – used for timing
+readonly RUN_START_TS="$(date +%s)"
 readonly RUN_START_HUMAN="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
-# ── Mutable runtime state (populated by getopts) ─────────────────────────────
+# ── Mutable runtime state ─────────────────────────────────────────────────────
 TARGET_DOMAIN=""
 WORDLIST_FILE=""
 OUTPUT_BASE_DIR=""
 
-# Module activation flags (0 = off, 1 = on)
+# Module activation flags
 RUN_RECON=0
 RUN_PORTSCAN=0
 RUN_SCREENSHOTS=0
@@ -100,11 +107,11 @@ RUN_VULN=0
 RUN_ALL=0
 RUN_NOTIFY=0
 
-# ── Notification configuration ────────────────────────────────────────────────
+# ── Notification credentials ──────────────────────────────────────────────────
 # Replace placeholder values with real credentials before using -n
-readonly TELEGRAM_BOT_TOKEN="__YOUR_TELEGRAM_BOT_TOKEN__"
-readonly TELEGRAM_CHAT_ID="__YOUR_TELEGRAM_CHAT_ID__"
-readonly DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/__YOUR_WEBHOOK_ID__/__YOUR_WEBHOOK_TOKEN__"
+readonly TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-__YOUR_TELEGRAM_BOT_TOKEN__}"
+readonly TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-__YOUR_TELEGRAM_CHAT_ID__}"
+readonly DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-https://discord.com/api/webhooks/__YOUR_WEBHOOK_ID__/__YOUR_WEBHOOK_TOKEN__}"
 
 # ── Global counters (accumulated across modules for metadata report) ──────────
 declare -A META_COUNTS=(
@@ -112,16 +119,18 @@ declare -A META_COUNTS=(
     [ports]=0
     [alive_hosts]=0
     [screenshots]=0
-    [historical_urls]=0
+    [total_urls]=0
     [js_files]=0
     [secrets]=0
     [hidden_params]=0
     [vuln_findings]=0
     [fuzz_hits]=0
+    [url_categories]=0
+    [origin_ips]=0
 )
 
 # ── Spinner state ─────────────────────────────────────────────────────────────
-SPINNER_PID=0   # PID of any currently-running spinner background process
+SPINNER_PID=0
 
 # ══════════════════════════════════════════════════════════════════════════════
 # §3 ─ CORE LOGGING & UI UTILITIES
@@ -133,7 +142,6 @@ log_warn()  { echo -e "${LOG_WARN}  ${C_BYELLOW}$*${C_RESET}"; }
 log_err()   { echo -e "${LOG_ERR}  ${C_BRED}$*${C_RESET}" >&2; }
 log_skip()  { echo -e "${LOG_SKIP}  ${C_DIM}$*${C_RESET}"; }
 
-# Fatal error → print message and exit immediately
 die() {
     local msg="$1"
     local code="${2:-1}"
@@ -141,7 +149,6 @@ die() {
     exit "${code}"
 }
 
-# Section header with double-rule border
 log_section() {
     local title="$1"
     echo ""
@@ -151,20 +158,22 @@ log_section() {
     echo ""
 }
 
+log_sub() {
+    # Indented sub-step within a module
+    echo -e "  ${C_DIM}├─${C_RESET}  ${C_WHITE}$*${C_RESET}"
+}
+
+log_sub_ok() {
+    echo -e "  ${C_DIM}└─${C_RESET}  ${C_BGREEN}$*${C_RESET}"
+}
+
 # ── Spinner ───────────────────────────────────────────────────────────────────
-# spinner_start <label>
-#   Launches a background spinner. Call spinner_stop when the job finishes.
-#   The spinner writes directly to stderr so it doesn't pollute stdout/logs.
 spinner_start() {
     local label="${1:-Working...}"
-    # Don't start a second spinner if one is already running
     [[ "${SPINNER_PID}" -ne 0 ]] && return 0
-
-    # Run spinner in a subshell so it can be killed cleanly
     (
         local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
         local i=0
-        # Disable SIGTERM default exit so we can clear the line first
         trap 'tput el1 2>/dev/null; printf "\r" >&2; exit 0' TERM
         while true; do
             printf "\r  ${C_BCYAN}%s${C_RESET}  ${C_DIM}%s${C_RESET}" \
@@ -173,26 +182,20 @@ spinner_start() {
             sleep 0.08
         done
     ) &
-
     SPINNER_PID=$!
-    # Ensure the spinner is always stopped on script exit (safety net)
     trap 'spinner_stop' EXIT
 }
 
-# spinner_stop
-#   Kills the background spinner and clears the spinner line.
 spinner_stop() {
     if [[ "${SPINNER_PID}" -ne 0 ]]; then
         kill "${SPINNER_PID}" 2>/dev/null || true
         wait "${SPINNER_PID}" 2>/dev/null || true
         SPINNER_PID=0
-        # Clear the spinner line
         printf "\r\033[K" >&2
     fi
 }
 
-# ── Elapsed time helper ───────────────────────────────────────────────────────
-# elapsed_since <epoch_seconds>  →  prints "Xm Ys"
+# elapsed_since <epoch_seconds>  →  "Xm Ys"
 elapsed_since() {
     local start="$1"
     local now
@@ -205,19 +208,17 @@ elapsed_since() {
 # §4 ─ PREFLIGHT VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# check_tool <binary>
-#   Non-fatal: returns 1 if missing (caller decides whether to skip or die).
+# check_tool <binary>  →  non-fatal, returns 1 if missing
 check_tool() {
     local tool="$1"
     if ! command -v "${tool}" &>/dev/null; then
-        log_warn "Optional tool not found in PATH: ${C_BOLD}${tool}${C_RESET}${C_BYELLOW} — dependent step will be skipped."
+        log_warn "Optional tool not found: ${C_BOLD}${tool}${C_RESET}${C_BYELLOW} — step will be skipped."
         return 1
     fi
     return 0
 }
 
-# check_required_tool <binary>
-#   Fatal variant: exits the script if the tool is missing.
+# check_required_tool <binary>  →  fatal if missing
 check_required_tool() {
     local tool="$1"
     if ! command -v "${tool}" &>/dev/null; then
@@ -225,20 +226,16 @@ check_required_tool() {
     fi
 }
 
-# validate_domain <string>
-#   Enforces a basic FQDN pattern; rejects bare IPs and protocol-prefixed strings.
 validate_domain() {
     local domain="$1"
     if [[ "${domain}" =~ ^https?:// ]]; then
-        die "Provide a bare domain without a protocol prefix (e.g. 'target.com', not 'https://target.com')." 2
+        die "Provide a bare domain without protocol prefix (e.g. 'target.com')." 2
     fi
     if [[ ! "${domain}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$ ]]; then
-        die "Invalid domain format: '${domain}'. Expected something like 'target.com'." 2
+        die "Invalid domain format: '${domain}'." 2
     fi
 }
 
-# validate_file <path> <label>
-#   Ensures a file path is non-empty and the file actually exists on disk.
 validate_file() {
     local filepath="$1"
     local label="${2:-file}"
@@ -246,8 +243,6 @@ validate_file() {
     [[ ! -f "${filepath}" ]] && die "The specified ${label} does not exist: '${filepath}'" 2
 }
 
-# ── Helper: safe line count ───────────────────────────────────────────────────
-# count_lines <file>  →  prints integer (0 if file missing/empty)
 count_lines() {
     local file="$1"
     if [[ -f "${file}" && -s "${file}" ]]; then
@@ -255,6 +250,85 @@ count_lines() {
     else
         echo "0"
     fi
+}
+
+# ── Preflight tool table ───────────────────────────────────────────────────────
+# Displayed at startup so the user knows what is / isn't available before
+# the pipeline begins. Grouped by module for easy reading.
+preflight_tool_check() {
+    log_section "PREFLIGHT — Tool Availability Check"
+
+    # Format: "tool:module_label"
+    local -a tool_map=(
+        # Recon
+        "subfinder:Recon"
+        "assetfinder:Recon"
+        "amass:Recon"
+        "findomain:Recon"
+        "chaos:Recon"
+        "github-subdomains:Recon"
+        "puredns:Recon(active)"
+        "dnsx:Recon(active)"
+        "ffuf:Recon(vhost)"
+        "httpx:Recon(alive)"
+        "anew:All(dedup)"
+        # Port scan
+        "naabu:PortScan"
+        "nmap:PortScan"
+        # Screenshots
+        "gowitness:Screenshots"
+        # URL discovery
+        "waybackurls:URLDiscovery"
+        "gau:URLDiscovery"
+        "gauplus:URLDiscovery"
+        "waymore:URLDiscovery"
+        "hakrawler:URLDiscovery"
+        "katana:URLDiscovery"
+        "gospider:URLDiscovery"
+        "paramspider:URLDiscovery"
+        # JS & Secrets
+        "subjs:JS+Secrets"
+        "mantra:JS+Secrets"
+        "jsecret:JS+Secrets"
+        "jsleak:JS+Secrets"
+        "trufflehog:JS+Secrets"
+        "lazyegg:JS+Secrets"
+        # Params
+        "arjun:HiddenParams"
+        "qsreplace:HiddenParams"
+        # Fuzzing
+        "feroxbuster:Fuzzing"
+        # Vuln
+        "nuclei:VulnScan"
+        # Utilities
+        "jq:Utilities"
+        "curl:Utilities"
+        "wget:Utilities"
+        "python3:Utilities"
+    )
+
+    local ok_count=0
+    local miss_count=0
+    local -A module_miss=()
+
+    for entry in "${tool_map[@]}"; do
+        local tool="${entry%%:*}"
+        local mod="${entry##*:}"
+        if command -v "${tool}" &>/dev/null; then
+            printf "  ${C_BGREEN}✔${C_RESET}  %-24s ${C_DIM}%s${C_RESET}\n" "${tool}" "[${mod}]"
+            (( ok_count++ )) || true
+        else
+            printf "  ${C_BYELLOW}○${C_RESET}  %-24s ${C_DIM}%s — not found${C_RESET}\n" "${tool}" "[${mod}]"
+            module_miss["${mod}"]="${module_miss["${mod}"]:-}${tool} "
+            (( miss_count++ )) || true
+        fi
+    done
+
+    echo ""
+    log_ok  "${ok_count} tool(s) available."
+    [[ "${miss_count}" -gt 0 ]] && \
+        log_warn "${miss_count} tool(s) missing — dependent steps will be skipped gracefully."
+    echo ""
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -266,17 +340,20 @@ setup_output_dirs() {
 
     log_info "Initialising output tree at: ${C_BOLD}${OUTPUT_BASE_DIR}/${C_RESET}"
 
-    # All subdirectories created here — add new module dirs in this list
     local -a subdirs=(
-        "subdomains"    # Raw + merged subdomain lists
-        "ports"         # naabu port scan results
-        "urls"          # Alive URL lists
-        "screenshots"   # gowitness captures
-        "fuzzing"       # ffuf output
-        "urldiscovery"  # gau / waybackurls historical URLs
-        "js"            # Extracted JS files + secret scan results
-        "params"        # arjun hidden parameter findings
-        "vulns"         # nuclei findings
+        "subdomains"          # Raw subdomain files + merged list
+        "subdomains/active"   # Brute-force / DNS-based results
+        "ports"               # naabu + nmap results
+        "urls"                # Alive URL lists
+        "screenshots"         # gowitness captures
+        "urldiscovery"        # All-source merged URL harvest
+        "urldiscovery/categories"   # Filtered category files
+        "js"                  # JS URLs + downloaded files
+        "js/files"            # Downloaded .js content for local scanning
+        "params"              # arjun + qsreplace parameter lists
+        "fuzzing"             # ffuf + feroxbuster results
+        "fuzzing/vhost"       # vhost-specific ffuf output
+        "vulns"               # nuclei findings
     )
 
     for dir in "${subdirs[@]}"; do
@@ -289,39 +366,18 @@ setup_output_dirs() {
 # ══════════════════════════════════════════════════════════════════════════════
 # §6 ─ STATE TRACKING & RESUME CAPABILITY
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Each module writes a tiny "stamp" file (.<module>.done) to the output root
-# when it completes successfully. On the next invocation, the script detects
-# these stamps and prompts the user to skip or re-run that module.
-#
-# Stamp file format:  recon_<domain>/.<module_name>.done
-# Contents           :  ISO-8601 completion timestamp (human reference only)
-# ──────────────────────────────────────────────────────────────────────────────
 
-# mark_done <module_name>
-#   Writes a completion stamp for the given module.
 mark_done() {
     local module="$1"
     echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
         > "${OUTPUT_BASE_DIR}/.${module}.done"
 }
 
-# is_done <module_name>
-#   Returns 0 (true) if the completion stamp exists, 1 otherwise.
 is_done() {
     local module="$1"
     [[ -f "${OUTPUT_BASE_DIR}/.${module}.done" ]]
 }
 
-# check_resume <module_name> <display_label>
-#   Called at the top of each module.
-#   If the module has already run, asks the user whether to re-run or skip.
-#   Echoes "skip" if the module should be skipped, "run" if it should execute.
-#
-# Usage:
-#   local resume_decision
-#   resume_decision="$(check_resume "recon" "Passive Recon")"
-#   [[ "${resume_decision}" == "skip" ]] && return 0
 check_resume() {
     local module="$1"
     local label="$2"
@@ -333,7 +389,6 @@ check_resume() {
         echo -e "  ${C_BYELLOW}⚡ Resume detected:${C_RESET} ${C_BOLD}${label}${C_RESET} was completed at ${C_DIM}${done_ts}${C_RESET}"
         echo -ne "  ${C_BCYAN}Skip this module and use existing results? [Y/n]:${C_RESET} "
 
-        # If stdin is not a terminal (e.g. piped), auto-skip for non-interactive runs
         if [[ ! -t 0 ]]; then
             echo "y (non-interactive: auto-skip)"
             echo "skip"
@@ -342,11 +397,10 @@ check_resume() {
 
         local answer
         read -r answer
-        answer="${answer,,}"   # lowercase
+        answer="${answer,,}"
 
         if [[ "${answer}" == "n" || "${answer}" == "no" ]]; then
             log_info "Re-running ${label} as requested."
-            # Remove the old stamp so a fresh one is written at the end
             rm -f "${OUTPUT_BASE_DIR}/.${module}.done"
             echo "run"
         else
@@ -361,20 +415,8 @@ check_resume() {
 # ══════════════════════════════════════════════════════════════════════════════
 # §7 ─ RICH NOTIFICATION MODULE
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Sends richly-formatted notifications to Telegram (MarkdownV2) and/or
-# Discord (Embed JSON) upon module completion.
-#
-# Usage:
-#   notify_module \
-#       "Port Scan" \           ← Module name
-#       "✅ Completed" \         ← Status line
-#       "Discovered 42 ports"   ← Detail line
-#       "1m 12s"                ← Elapsed time
-# ──────────────────────────────────────────────────────────────────────────────
 
 notify_module() {
-    # Guard: skip entirely if -n flag was not passed
     [[ "${RUN_NOTIFY}" -eq 0 ]] && return 0
 
     local module_name="${1:-Unknown Module}"
@@ -385,11 +427,7 @@ notify_module() {
     now_human="$(date -u +'%Y-%m-%d %H:%M UTC')"
 
     # ── Telegram (MarkdownV2) ─────────────────────────────────────────────────
-    # MarkdownV2 requires escaping: _ * [ ] ( ) ~ ` > # + - = | { } . !
     if [[ "${TELEGRAM_BOT_TOKEN}" != *"__YOUR_TELEGRAM"* ]]; then
-
-        # Build a nicely formatted Markdown message
-        # Escaping is minimal here for readability — add \-escapes for special chars
         local tg_text
         tg_text="$(printf \
 '🔍 *ReconSH v%s* — %s
@@ -425,9 +463,6 @@ notify_module() {
 
     # ── Discord (Rich Embed JSON) ─────────────────────────────────────────────
     if [[ "${DISCORD_WEBHOOK_URL}" != *"__YOUR_WEBHOOK_ID__"* ]]; then
-
-        # Discord embeds use a colour integer: 0x00BFFF = 49151 (deep sky blue)
-        # Swap colour for RED (15158332) on critical findings, etc.
         local embed_colour=49151
         [[ "${status_line}" == *"⚠"* || "${status_line}" == *"ERROR"* ]] \
             && embed_colour=15158332
@@ -468,93 +503,246 @@ JSON
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §8 ─ MODULE: PASSIVE RECON  (-r)
+# §8 ─ MODULE: PASSIVE + ACTIVE SUBDOMAIN RECON  (-r)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Pipeline:
-#   subfinder ─┐
-#              ├─ anew ─► all_subs.txt ─► httpx ─► alive_hosts.txt
-#   assetfinder┘                                  └─► alive_urls.txt (plain)
+# PASSIVE SOURCES:
+#   subfinder (-all -recursive) · assetfinder · amass · findomain
+#   chaos (PDCP_API_KEY) · github-subdomains (GITHUB_TOKEN) · crt.sh
 #
-# Output files:
-#   subdomains/subfinder.txt      Raw subfinder hits
-#   subdomains/assetfinder.txt    Raw assetfinder hits
-#   subdomains/all_subs.txt       Merged + deduplicated
-#   urls/alive_hosts.txt          httpx full output (status/title/tech)
-#   urls/alive_urls.txt           Plain URL list for downstream tools
+# ACTIVE / BRUTE-FORCE:
+#   puredns bruteforce (wordlist) · dnsx wordlist · vhost probe via httpx
+#
+# STEP 2 MERGE LOGIC (from methodology):
+#   cat subs_*.txt | anew | tee all_subs.txt   (anew deduplicates in-place)
+#   Fallback: sort -u if anew is unavailable
+#
+# OUTPUT FILES:
+#   subdomains/subs_subfinder.txt        Raw subfinder output
+#   subdomains/subs_assetfinder.txt      Raw assetfinder output
+#   subdomains/subs_amass.txt            Raw amass output
+#   subdomains/subs_findomain.txt        Raw findomain output
+#   subdomains/subs_chaos.txt            Raw chaos output
+#   subdomains/subs_github.txt           Raw github-subdomains output
+#   subdomains/subs_crtsh.txt            Certificate transparency results
+#   subdomains/active/subs_puredns.txt   puredns brute-force results
+#   subdomains/active/subs_dnsx.txt      dnsx brute-force results
+#   subdomains/all_subs.txt              Merged + deduplicated master list
+#   urls/alive_hosts.txt                 httpx full output (status/title/tech)
+#   urls/alive_urls.txt                  Plain URL list for downstream modules
 # ──────────────────────────────────────────────────────────────────────────────
 module_recon() {
-    log_section "MODULE ─ Passive Subdomain Recon  [-r]"
+    log_section "MODULE ─ Passive + Active Subdomain Recon  [-r]"
 
     local decision
-    decision="$(check_resume "recon" "Passive Recon")"
+    decision="$(check_resume "recon" "Passive + Active Recon")"
     [[ "${decision}" == "skip" ]] && return 0
 
     local t0; t0="$(date +%s)"
     local subs_dir="${OUTPUT_BASE_DIR}/subdomains"
+    local active_dir="${subs_dir}/active"
     local urls_dir="${OUTPUT_BASE_DIR}/urls"
     local all_subs="${subs_dir}/all_subs.txt"
 
-    # ── subfinder ──────────────────────────────────────────────────────────────
+    # ── PASSIVE: subfinder ─────────────────────────────────────────────────────
     if check_tool "subfinder"; then
-        log_info "Running ${C_BOLD}subfinder${C_RESET} on ${TARGET_DOMAIN}..."
-        spinner_start "subfinder enumerating…"
+        log_sub "subfinder (-all -recursive) …"
+        spinner_start "subfinder enumerating all sources…"
         subfinder \
             -d "${TARGET_DOMAIN}" \
-            -silent \
             -all \
-            -o "${subs_dir}/subfinder.txt" \
+            -recursive \
+            -silent \
+            -o "${subs_dir}/subs_subfinder.txt" \
             2>/dev/null || true
         spinner_stop
-        log_ok "subfinder → $(count_lines "${subs_dir}/subfinder.txt") results"
+        log_sub_ok "subfinder → $(count_lines "${subs_dir}/subs_subfinder.txt") results"
     fi
 
-    # ── assetfinder ───────────────────────────────────────────────────────────
+    # ── PASSIVE: assetfinder ───────────────────────────────────────────────────
     if check_tool "assetfinder"; then
-        log_info "Running ${C_BOLD}assetfinder${C_RESET} on ${TARGET_DOMAIN}..."
+        log_sub "assetfinder …"
         spinner_start "assetfinder enumerating…"
-        assetfinder --subs-only "${TARGET_DOMAIN}" \
-            > "${subs_dir}/assetfinder.txt" 2>/dev/null || true
+        echo "${TARGET_DOMAIN}" | assetfinder --subs-only \
+            > "${subs_dir}/subs_assetfinder.txt" 2>/dev/null || true
         spinner_stop
-        log_ok "assetfinder → $(count_lines "${subs_dir}/assetfinder.txt") results"
+        log_sub_ok "assetfinder → $(count_lines "${subs_dir}/subs_assetfinder.txt") results"
     fi
 
-    # ── Merge & deduplicate ───────────────────────────────────────────────────
-    log_info "Merging sources and deduplicating..."
+    # ── PASSIVE: amass ─────────────────────────────────────────────────────────
+    if check_tool "amass"; then
+        log_sub "amass enum (passive) …"
+        spinner_start "amass enumerating (passive)…"
+        amass enum \
+            -d "${TARGET_DOMAIN}" \
+            -passive \
+            -o "${subs_dir}/subs_amass.txt" \
+            2>/dev/null || true
+        spinner_stop
+        log_sub_ok "amass → $(count_lines "${subs_dir}/subs_amass.txt") results"
+    fi
+
+    # ── PASSIVE: findomain ─────────────────────────────────────────────────────
+    if check_tool "findomain"; then
+        log_sub "findomain …"
+        spinner_start "findomain enumerating…"
+        findomain \
+            -t "${TARGET_DOMAIN}" \
+            -u "${subs_dir}/subs_findomain.txt" \
+            2>/dev/null || true
+        spinner_stop
+        log_sub_ok "findomain → $(count_lines "${subs_dir}/subs_findomain.txt") results"
+    fi
+
+    # ── PASSIVE: chaos ─────────────────────────────────────────────────────────
+    if check_tool "chaos"; then
+        if [[ -n "${PDCP_API_KEY:-}" ]]; then
+            log_sub "chaos (PDCP) …"
+            spinner_start "chaos querying ProjectDiscovery…"
+            chaos \
+                -d "${TARGET_DOMAIN}" \
+                -silent \
+                -o "${subs_dir}/subs_chaos.txt" \
+                2>/dev/null || true
+            spinner_stop
+            log_sub_ok "chaos → $(count_lines "${subs_dir}/subs_chaos.txt") results"
+        else
+            log_warn "chaos installed but PDCP_API_KEY not exported — skipping."
+        fi
+    fi
+
+    # ── PASSIVE: github-subdomains ─────────────────────────────────────────────
+    if check_tool "github-subdomains"; then
+        if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+            log_sub "github-subdomains …"
+            spinner_start "github-subdomains scraping GitHub…"
+            github-subdomains \
+                -d "${TARGET_DOMAIN}" \
+                -t "${GITHUB_TOKEN}" \
+                -o "${subs_dir}/subs_github.txt" \
+                2>/dev/null || true
+            spinner_stop
+            log_sub_ok "github-subdomains → $(count_lines "${subs_dir}/subs_github.txt") results"
+        else
+            log_warn "github-subdomains installed but GITHUB_TOKEN not exported — skipping."
+        fi
+    fi
+
+    # ── PASSIVE: certificate transparency (crt.sh) ────────────────────────────
+    log_sub "crt.sh certificate transparency …"
+    spinner_start "querying crt.sh…"
+    curl -s --max-time 30 \
+        "https://crt.sh/?q=%25.${TARGET_DOMAIN}&output=json" 2>/dev/null \
+        | python3 -c "
+import sys, json, re
+escaped = re.escape('${TARGET_DOMAIN}')
+pattern = re.compile(r'[A-Za-z0-9._-]+\.' + escaped + r'$')
+seen = set()
+try:
+    data = json.load(sys.stdin)
+    for item in data:
+        for name in item.get('name_value','').split('\n'):
+            clean = name.strip().lstrip('*.')
+            if pattern.fullmatch(clean) and clean not in seen:
+                seen.add(clean)
+                print(clean)
+except Exception:
+    pass
+" > "${subs_dir}/subs_crtsh.txt" 2>/dev/null || true
+    spinner_stop
+    log_sub_ok "crt.sh → $(count_lines "${subs_dir}/subs_crtsh.txt") results"
+
+    # ── ACTIVE: puredns bruteforce ─────────────────────────────────────────────
+    if [[ -n "${WORDLIST_FILE}" ]] && check_tool "puredns"; then
+        log_sub "puredns bruteforce …"
+
+        # Download a public resolver list if not already present
+        local resolvers_file="${active_dir}/resolvers.txt"
+        if [[ ! -f "${resolvers_file}" ]]; then
+            log_sub "Fetching public resolver list …"
+            wget -q -O "${resolvers_file}" \
+                "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" \
+                2>/dev/null || touch "${resolvers_file}"
+        fi
+
+        spinner_start "puredns bruteforcing subdomains…"
+        puredns bruteforce \
+            "${WORDLIST_FILE}" \
+            "${TARGET_DOMAIN}" \
+            -r "${resolvers_file}" \
+            --write "${active_dir}/subs_puredns.txt" \
+            2>/dev/null || true
+        spinner_stop
+        log_sub_ok "puredns → $(count_lines "${active_dir}/subs_puredns.txt") resolved subdomains"
+    elif [[ -z "${WORDLIST_FILE}" ]]; then
+        log_skip "puredns — no wordlist supplied (-l). Skipping active bruteforce."
+    fi
+
+    # ── ACTIVE: dnsx wordlist brute ────────────────────────────────────────────
+    if [[ -n "${WORDLIST_FILE}" ]] && check_tool "dnsx"; then
+        log_sub "dnsx wordlist bruteforce …"
+        spinner_start "dnsx resolving wordlist entries…"
+        dnsx \
+            -silent \
+            -d "${TARGET_DOMAIN}" \
+            -w "${WORDLIST_FILE}" \
+            -o "${active_dir}/subs_dnsx.txt" \
+            2>/dev/null || true
+        spinner_stop
+        log_sub_ok "dnsx → $(count_lines "${active_dir}/subs_dnsx.txt") results"
+    fi
+
+    # ── STEP 2: Merge & deduplicate (methodology §2 logic) ────────────────────
+    log_info "Merging all sources → deduplicating (Step 2: anew / sort -u) …"
+
+    # Collect every per-tool file into one pipe
+    local all_raw_combined="${subs_dir}/subs_combined_raw.txt"
+    cat \
+        "${subs_dir}/subs_subfinder.txt" \
+        "${subs_dir}/subs_assetfinder.txt" \
+        "${subs_dir}/subs_amass.txt" \
+        "${subs_dir}/subs_findomain.txt" \
+        "${subs_dir}/subs_chaos.txt" \
+        "${subs_dir}/subs_github.txt" \
+        "${subs_dir}/subs_crtsh.txt" \
+        "${active_dir}/subs_puredns.txt" \
+        "${active_dir}/subs_dnsx.txt" \
+        2>/dev/null | grep -v '^$' | sort > "${all_raw_combined}" || true
+
     if check_tool "anew"; then
         touch "${all_subs}"
-        cat "${subs_dir}"/*.txt 2>/dev/null \
-            | grep -v '^$' | sort \
-            | anew "${all_subs}" > /dev/null
+        anew "${all_subs}" < "${all_raw_combined}" > /dev/null
     else
-        log_warn "'anew' not found — falling back to sort -u"
-        cat "${subs_dir}"/*.txt 2>/dev/null \
-            | grep -v '^$' | sort -u > "${all_subs}"
+        log_warn "anew not found — falling back to sort -u"
+        sort -u "${all_raw_combined}" > "${all_subs}"
     fi
 
     if [[ ! -s "${all_subs}" ]]; then
-        log_warn "No subdomains discovered. Recon module complete with zero results."
-        notify_module "Passive Recon" "⚠️ No subdomains found" \
-            "Zero subdomains discovered for ${TARGET_DOMAIN}" "$(elapsed_since "${t0}")"
+        log_warn "No subdomains discovered. Recon complete with zero results."
+        notify_module "Passive + Active Recon" "⚠️ No subdomains found" \
+            "Zero subdomains for ${TARGET_DOMAIN}" "$(elapsed_since "${t0}")"
+        mark_done "recon"
         return 0
     fi
 
     META_COUNTS[subdomains]="$(count_lines "${all_subs}")"
-    log_ok "Total unique subdomains: ${C_BOLD}${META_COUNTS[subdomains]}${C_RESET}"
+    log_ok "Total unique subdomains: ${C_BOLD}${META_COUNTS[subdomains]}${C_RESET} → ${all_subs}"
 
-    # ── httpx live-host probing ────────────────────────────────────────────────
+    # ── httpx: alive host probing ─────────────────────────────────────────────
     check_required_tool "httpx"
-    log_info "Probing live hosts with ${C_BOLD}httpx${C_RESET}..."
-    spinner_start "httpx probing live hosts…"
+    log_info "Probing live hosts with ${C_BOLD}httpx${C_RESET} (-threads 200) …"
+    spinner_start "httpx probing alive hosts…"
 
     httpx \
         -l "${all_subs}" \
         -silent \
         -status-code \
+        -content-length \
+        -web-server \
         -title \
         -tech-detect \
         -follow-redirects \
-        -threads 50 \
+        -threads 200 \
         -timeout 10 \
         -o "${urls_dir}/alive_hosts.txt" \
         2>/dev/null || true
@@ -562,7 +750,6 @@ module_recon() {
     spinner_stop
 
     if [[ -s "${urls_dir}/alive_hosts.txt" ]]; then
-        # Extract clean URL column (first whitespace-delimited field)
         awk '{print $1}' "${urls_dir}/alive_hosts.txt" \
             | grep -E '^https?://' \
             > "${urls_dir}/alive_urls.txt" 2>/dev/null || true
@@ -574,7 +761,7 @@ module_recon() {
     fi
 
     mark_done "recon"
-    notify_module "Passive Recon" "✅ Completed" \
+    notify_module "Passive + Active Recon" "✅ Completed" \
         "Subdomains: ${META_COUNTS[subdomains]} | Alive: ${META_COUNTS[alive_hosts]}" \
         "$(elapsed_since "${t0}")"
     log_ok "Recon module finished.  [${C_DIM}$(elapsed_since "${t0}")${C_RESET}]"
@@ -584,19 +771,19 @@ module_recon() {
 # §9 ─ MODULE: PORT SCANNING  (-P)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Motivation: Default recon only probes 80/443. Admin panels, dev servers, and
-# vulnerable APIs frequently live on non-standard ports (8080, 8443, 9200, etc.).
-#
 # Pipeline:
-#   all_subs.txt ─► naabu ─► open_ports.txt (host:port)
-#                         └─► httpx on host:port pairs ─► alive_urls.txt (appended)
+#   all_subs.txt ─► naabu (-p - -rate 2000) ─► ports/naabu_all.txt
+#                └─► nmap (-T4 -Pn) service scan ─► ports/nmap_scan.*
+#                └─► httpx on non-std ports ─► urls/alive_urls.txt (appended)
 #
 # Output files:
-#   ports/naabu_all.txt       All naabu "host:port" pairs
-#   ports/naabu_filtered.txt  Filtered to non-standard web ports only
+#   ports/naabu_all.txt        All host:port pairs (all 65535 ports)
+#   ports/naabu_filtered.txt   Non-standard web ports only
+#   ports/nmap_scan.xml/.txt   nmap XML + greppable output
+#   urls/alive_nonstandard.txt httpx results on non-standard ports
 # ──────────────────────────────────────────────────────────────────────────────
 module_portscan() {
-    log_section "MODULE ─ Port Scanning via naabu  [-P]"
+    log_section "MODULE ─ Port Scanning  [-P]"
 
     local decision
     decision="$(check_resume "portscan" "Port Scan")"
@@ -608,104 +795,104 @@ module_portscan() {
     local urls_dir="${OUTPUT_BASE_DIR}/urls"
     local all_subs="${subs_dir}/all_subs.txt"
 
-    # Prereq: subdomain list must exist
     if [[ ! -s "${all_subs}" ]]; then
-        log_warn "No subdomain list found at '${all_subs}'. Run -r (Recon) first."
+        log_warn "No subdomain list at '${all_subs}'. Run -r (Recon) first."
         log_skip "Skipping Port Scan module."
         return 0
     fi
 
-    check_required_tool "naabu"
-    check_required_tool "httpx"
-
     local sub_count
     sub_count="$(count_lines "${all_subs}")"
-    log_info "Running ${C_BOLD}naabu${C_RESET} against ${sub_count} subdomains..."
-    log_warn "Port scanning can be slow. Consider using -p for specific ports."
 
-    # naabu flags:
-    #   -list    : input file of hosts
-    #   -top-ports 1000 : scan the 1000 most common ports
-    #   -silent  : suppress banner
-    #   -o       : output file
-    #   -c       : concurrent hosts
-    #   -rate    : packets per second (tune to avoid triggering WAF)
-    #   -exclude-ports : skip pure non-HTTP ports (22,25,53,110,143,587,993)
-    spinner_start "naabu scanning ports…"
-    naabu \
-        -list "${all_subs}" \
-        -top-ports 1000 \
-        -silent \
-        -o "${ports_dir}/naabu_all.txt" \
-        -c 50 \
-        -rate 1000 \
-        -exclude-ports 22,25,53,110,143,587,993,995 \
-        2>/dev/null || true
-    spinner_stop
+    # ── naabu: full-port scan ─────────────────────────────────────────────────
+    if check_tool "naabu"; then
+        log_info "Running ${C_BOLD}naabu${C_RESET} (-p - -rate 2000) on ${sub_count} subdomains …"
+        log_warn "Full port scan (-p -) is comprehensive — may take several minutes."
+        spinner_start "naabu scanning all 65535 ports…"
 
-    META_COUNTS[ports]="$(count_lines "${ports_dir}/naabu_all.txt")"
-    log_ok "naabu discovered ${C_BOLD}${META_COUNTS[ports]}${C_RESET} open port(s)."
-
-    if [[ ! -s "${ports_dir}/naabu_all.txt" ]]; then
-        log_warn "No open ports found beyond defaults."
-        mark_done "portscan"
-        return 0
-    fi
-
-    # ── Filter to non-standard web ports ─────────────────────────────────────
-    # Keep entries whose port is NOT 80 or 443 — these are the interesting ones
-    grep -vE ':(80|443)$' "${ports_dir}/naabu_all.txt" \
-        > "${ports_dir}/naabu_filtered.txt" 2>/dev/null || true
-
-    local filtered_count
-    filtered_count="$(count_lines "${ports_dir}/naabu_filtered.txt")"
-    log_info "Non-standard web ports: ${C_BOLD}${filtered_count}${C_RESET}"
-
-    # ── Feed non-standard ports back into httpx ────────────────────────────────
-    if [[ -s "${ports_dir}/naabu_filtered.txt" ]]; then
-        log_info "Probing non-standard ports with ${C_BOLD}httpx${C_RESET}..."
-        spinner_start "httpx probing non-standard ports…"
-
-        local nonstandard_alive="${urls_dir}/alive_nonstandard.txt"
-        httpx \
-            -l "${ports_dir}/naabu_filtered.txt" \
+        naabu \
+            -list "${all_subs}" \
+            -p - \
+            -rate 2000 \
             -silent \
-            -status-code \
-            -title \
-            -tech-detect \
-            -follow-redirects \
-            -threads 50 \
-            -timeout 10 \
-            -o "${nonstandard_alive}" \
+            -o "${ports_dir}/naabu_all.txt" \
+            -exclude-ports 22,25,53,110,143,587,993,995 \
             2>/dev/null || true
 
         spinner_stop
+        META_COUNTS[ports]="$(count_lines "${ports_dir}/naabu_all.txt")"
+        log_ok "naabu discovered ${C_BOLD}${META_COUNTS[ports]}${C_RESET} open port(s)."
 
-        if [[ -s "${nonstandard_alive}" ]]; then
-            local ns_count
-            ns_count="$(count_lines "${nonstandard_alive}")"
-            log_ok "Alive on non-standard ports: ${C_BOLD}${ns_count}${C_RESET}"
+        # Filter to non-standard web ports
+        grep -vE ':(80|443)$' "${ports_dir}/naabu_all.txt" \
+            > "${ports_dir}/naabu_filtered.txt" 2>/dev/null || true
 
-            # Append unique new URLs to the master alive_urls.txt
-            if check_tool "anew"; then
-                awk '{print $1}' "${nonstandard_alive}" \
-                    | grep -E '^https?://' \
-                    | anew "${urls_dir}/alive_urls.txt" >> /dev/null
-            else
-                awk '{print $1}' "${nonstandard_alive}" \
-                    | grep -E '^https?://' \
-                    >> "${urls_dir}/alive_urls.txt"
-                sort -u -o "${urls_dir}/alive_urls.txt" "${urls_dir}/alive_urls.txt"
+        local filtered_count
+        filtered_count="$(count_lines "${ports_dir}/naabu_filtered.txt")"
+        log_info "Non-standard web ports: ${C_BOLD}${filtered_count}${C_RESET}"
+
+        # Feed non-standard ports into httpx
+        if [[ -s "${ports_dir}/naabu_filtered.txt" ]] && check_tool "httpx"; then
+            log_info "Probing non-standard ports with ${C_BOLD}httpx${C_RESET} …"
+            spinner_start "httpx probing non-standard ports…"
+
+            httpx \
+                -l "${ports_dir}/naabu_filtered.txt" \
+                -silent \
+                -status-code \
+                -title \
+                -tech-detect \
+                -follow-redirects \
+                -threads 50 \
+                -timeout 10 \
+                -o "${urls_dir}/alive_nonstandard.txt" \
+                2>/dev/null || true
+
+            spinner_stop
+
+            if [[ -s "${urls_dir}/alive_nonstandard.txt" ]]; then
+                local ns_count
+                ns_count="$(count_lines "${urls_dir}/alive_nonstandard.txt")"
+                log_ok "Alive on non-standard ports: ${C_BOLD}${ns_count}${C_RESET}"
+
+                if check_tool "anew"; then
+                    awk '{print $1}' "${urls_dir}/alive_nonstandard.txt" \
+                        | grep -E '^https?://' \
+                        | anew "${urls_dir}/alive_urls.txt" > /dev/null
+                else
+                    awk '{print $1}' "${urls_dir}/alive_nonstandard.txt" \
+                        | grep -E '^https?://' \
+                        >> "${urls_dir}/alive_urls.txt"
+                    sort -u -o "${urls_dir}/alive_urls.txt" "${urls_dir}/alive_urls.txt"
+                fi
+                META_COUNTS[alive_hosts]="$(count_lines "${urls_dir}/alive_urls.txt")"
             fi
-
-            log_ok "Master alive_urls.txt updated with non-standard port hosts."
-            META_COUNTS[alive_hosts]="$(count_lines "${urls_dir}/alive_urls.txt")"
         fi
+    else
+        log_warn "naabu not found — skipping full-port scan."
+    fi
+
+    # ── nmap: service / version detection ─────────────────────────────────────
+    if check_tool "nmap"; then
+        log_info "Running ${C_BOLD}nmap${C_RESET} (-T4 -Pn) on subdomain list …"
+        spinner_start "nmap service fingerprinting…"
+
+        nmap \
+            -iL "${all_subs}" \
+            -T4 \
+            -Pn \
+            -oA "${ports_dir}/nmap_scan" \
+            2>/dev/null || true
+
+        spinner_stop
+        log_ok "nmap scan saved → ${ports_dir}/nmap_scan.{nmap,xml,gnmap}"
+    else
+        log_warn "nmap not found — skipping service scan."
     fi
 
     mark_done "portscan"
     notify_module "Port Scan" "✅ Completed" \
-        "Open ports: ${META_COUNTS[ports]} | Non-standard: ${filtered_count}" \
+        "naabu ports: ${META_COUNTS[ports]} | Alive (total): ${META_COUNTS[alive_hosts]}" \
         "$(elapsed_since "${t0}")"
     log_ok "Port Scan module finished.  [${C_DIM}$(elapsed_since "${t0}")${C_RESET}]"
 }
@@ -713,14 +900,6 @@ module_portscan() {
 # ══════════════════════════════════════════════════════════════════════════════
 # §10 ─ MODULE: SCREENSHOTS  (-s)
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Visual recon: captures screenshots of every alive host using gowitness.
-# Essential for quickly triaging large asset sets without visiting each URL.
-#
-# Output files:
-#   screenshots/*.png            Individual screenshots
-#   screenshots/gowitness.sqlite3  gowitness database (for report generation)
-# ──────────────────────────────────────────────────────────────────────────────
 module_screenshots() {
     log_section "MODULE ─ Visual Recon / Screenshots  [-s]"
 
@@ -742,7 +921,7 @@ module_screenshots() {
 
     local url_count
     url_count="$(count_lines "${alive_urls}")"
-    log_info "Taking screenshots of ${C_BOLD}${url_count}${C_RESET} hosts..."
+    log_info "Taking screenshots of ${C_BOLD}${url_count}${C_RESET} hosts …"
 
     spinner_start "gowitness capturing screenshots…"
     gowitness file \
@@ -756,7 +935,7 @@ module_screenshots() {
 
     META_COUNTS[screenshots]="$(find "${shots_dir}" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')"
     log_ok "Screenshots captured: ${C_BOLD}${META_COUNTS[screenshots]}${C_RESET}"
-    log_info "Generate HTML report: ${C_CYAN}gowitness report serve --db-path ${shots_dir}/gowitness.sqlite3${C_RESET}"
+    log_info "HTML report: ${C_CYAN}gowitness report serve --db-path ${shots_dir}/gowitness.sqlite3${C_RESET}"
 
     mark_done "screenshots"
     notify_module "Screenshots" "✅ Completed" \
@@ -766,25 +945,32 @@ module_screenshots() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §11 ─ MODULE: HISTORICAL URL DISCOVERY  (-u)
+# §11 ─ MODULE: URL DISCOVERY  (-u)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Mines archived/historical URLs from:
-#   - gau        (GetAllUrls: Wayback, AlienVault OTX, Common Crawl)
-#   - waybackurls (Wayback Machine specifically)
+# 10-SOURCE HARVEST (matching methodology §4):
+#   waybackurls · gau (--threads 200) · gauplus (-t 200) · waymore
+#   hakrawler · katana (-jc -kf all -d 5 -headless) · gospider
+#   paramspider
 #
-# Post-processing pipeline:
-#   raw URLs → strip params → filter extensions → dedup → clean_urls.txt
+# STEP 4 MERGE LOGIC:
+#   cat *_raw.txt | anew | tee all_urls_raw.txt
 #
-# Output files:
-#   urldiscovery/gau_raw.txt          Raw gau output
-#   urldiscovery/wayback_raw.txt      Raw waybackurls output
-#   urldiscovery/all_urls_raw.txt     Merged raw URLs
-#   urldiscovery/all_urls_clean.txt   Deduplicated, extension-filtered URLs
-#   urldiscovery/urls_params.txt      URLs that contain query parameters
+# CATEGORY FILTERING (methodology §4 extract-interesting logic):
+#   .js · .php · .asp(x) · .jsp(x) · JSON/XML/GraphQL · sensitive files
+#   login flows · admin panels · upload endpoints · IDOR targets
+#   cloud leaks · interesting endpoints · injection candidates (= params)
+#   Wayback sensitive-extension grep pattern
+#
+# OUTPUT FILES:
+#   urldiscovery/*_raw.txt           Per-tool raw output
+#   urldiscovery/all_urls_raw.txt    Merged raw URL list
+#   urldiscovery/all_urls_clean.txt  Deduplicated, noise-filtered
+#   urldiscovery/urls_params.txt     URLs containing query parameters
+#   urldiscovery/categories/*.txt    Category-filtered URL subsets
 # ──────────────────────────────────────────────────────────────────────────────
 module_url_discovery() {
-    log_section "MODULE ─ Historical URL Discovery  [-u]"
+    log_section "MODULE ─ Multi-Source URL Discovery  [-u]"
 
     local decision
     decision="$(check_resume "urldiscovery" "URL Discovery")"
@@ -793,82 +979,230 @@ module_url_discovery() {
     local t0; t0="$(date +%s)"
     local urls_dir="${OUTPUT_BASE_DIR}/urls"
     local disc_dir="${OUTPUT_BASE_DIR}/urldiscovery"
+    local cats_dir="${disc_dir}/categories"
     local alive_urls="${urls_dir}/alive_urls.txt"
+    local alive_subs="${OUTPUT_BASE_DIR}/subdomains/all_subs.txt"
     local all_raw="${disc_dir}/all_urls_raw.txt"
 
     if [[ ! -s "${alive_urls}" ]]; then
-        log_warn "No alive URLs found. Run -r (Recon) first."
+        log_warn "No alive URLs at '${alive_urls}'. Run -r (Recon) first."
         log_skip "Skipping URL Discovery module."
         return 0
     fi
 
-    # ── gau ──────────────────────────────────────────────────────────────────
-    if check_tool "gau"; then
-        log_info "Running ${C_BOLD}gau${C_RESET} against ${TARGET_DOMAIN}..."
-        spinner_start "gau harvesting historical URLs…"
-        gau \
-            --threads 5 \
-            --blacklist ttf,woff,woff2,ico,jpg,jpeg,gif,png,svg,css \
-            --subs \
-            "${TARGET_DOMAIN}" \
-            > "${disc_dir}/gau_raw.txt" 2>/dev/null || true
-        spinner_stop
-        log_ok "gau → $(count_lines "${disc_dir}/gau_raw.txt") URLs"
-    else
-        log_warn "gau not found — skipping gau step."
-    fi
+    touch "${all_raw}"
 
     # ── waybackurls ───────────────────────────────────────────────────────────
     if check_tool "waybackurls"; then
-        log_info "Running ${C_BOLD}waybackurls${C_RESET} against ${TARGET_DOMAIN}..."
+        log_sub "waybackurls …"
         spinner_start "waybackurls querying Wayback Machine…"
-        echo "${TARGET_DOMAIN}" \
-            | waybackurls \
-            > "${disc_dir}/wayback_raw.txt" 2>/dev/null || true
+        cat "${alive_subs}" 2>/dev/null | waybackurls \
+            > "${disc_dir}/wb_raw.txt" 2>/dev/null || true
         spinner_stop
-        log_ok "waybackurls → $(count_lines "${disc_dir}/wayback_raw.txt") URLs"
-    else
-        log_warn "waybackurls not found — skipping Wayback step."
+        log_sub_ok "waybackurls → $(count_lines "${disc_dir}/wb_raw.txt") URLs"
     fi
 
-    # ── Merge and deduplicate ─────────────────────────────────────────────────
-    log_info "Merging and deduplicating URL sources..."
-    touch "${all_raw}"
+    # ── gau (--threads 200) ───────────────────────────────────────────────────
+    if check_tool "gau"; then
+        log_sub "gau (--threads 200) …"
+        spinner_start "gau harvesting historical URLs…"
+        cat "${alive_subs}" 2>/dev/null | gau \
+            --threads 200 \
+            --blacklist ttf,woff,woff2,ico,jpg,jpeg,gif,png,svg,css \
+            --subs \
+            > "${disc_dir}/gau_raw.txt" 2>/dev/null || true
+        spinner_stop
+        log_sub_ok "gau → $(count_lines "${disc_dir}/gau_raw.txt") URLs"
+    fi
 
-    local src
-    for src in "${disc_dir}/gau_raw.txt" "${disc_dir}/wayback_raw.txt"; do
-        [[ -f "${src}" ]] && cat "${src}" >> "${all_raw}"
-    done
+    # ── gauplus (-t 200) ──────────────────────────────────────────────────────
+    if check_tool "gauplus"; then
+        log_sub "gauplus (-t 200 -random-agent) …"
+        spinner_start "gauplus harvesting URLs…"
+        gauplus \
+            -t 200 \
+            -random-agent \
+            < "${alive_subs}" \
+            > "${disc_dir}/gauplus_raw.txt" 2>/dev/null || true
+        spinner_stop
+        log_sub_ok "gauplus → $(count_lines "${disc_dir}/gauplus_raw.txt") URLs"
+    fi
+
+    # ── waymore ───────────────────────────────────────────────────────────────
+    if check_tool "waymore"; then
+        log_sub "waymore (-mode U -l 1000 -from 2021) …"
+        spinner_start "waymore harvesting archived URLs…"
+        waymore \
+            -i "${alive_subs}" \
+            -mode U \
+            -l 1000 \
+            -from 2021 \
+            -oU "${disc_dir}/waymore_raw.txt" \
+            2>/dev/null || true
+        spinner_stop
+        log_sub_ok "waymore → $(count_lines "${disc_dir}/waymore_raw.txt") URLs"
+    fi
+
+    # ── hakrawler (-subs -u -insecure) ────────────────────────────────────────
+    if check_tool "hakrawler"; then
+        log_sub "hakrawler (-subs -u -insecure) …"
+        spinner_start "hakrawler crawling alive hosts…"
+        cat "${alive_urls}" | hakrawler \
+            -subs \
+            -u \
+            -insecure \
+            > "${disc_dir}/hakrawler_raw.txt" 2>/dev/null || true
+        spinner_stop
+        log_sub_ok "hakrawler → $(count_lines "${disc_dir}/hakrawler_raw.txt") URLs"
+    fi
+
+    # ── katana (-jc -kf all -d 5 -headless -fx -aff -fs rdn) ─────────────────
+    if check_tool "katana"; then
+        log_sub "katana (-jc -kf all -d 5 -headless) …"
+        spinner_start "katana crawling with JS execution…"
+        katana \
+            -u "${alive_urls}" \
+            -jc \
+            -kf all \
+            -d 5 \
+            -headless \
+            -fx \
+            -aff \
+            -fs rdn \
+            -f url \
+            -silent \
+            -o "${disc_dir}/katana_raw.txt" \
+            2>/dev/null || true
+        spinner_stop
+        log_sub_ok "katana → $(count_lines "${disc_dir}/katana_raw.txt") URLs"
+    fi
+
+    # ── gospider (-t 20 -d 3 --js --sitemap --robots) ────────────────────────
+    if check_tool "gospider"; then
+        log_sub "gospider (-t 20 -d 3 --js --sitemap --robots) …"
+        spinner_start "gospider crawling…"
+        local gospider_out="${disc_dir}/gospider_raw_dir"
+        mkdir -p "${gospider_out}"
+        gospider \
+            -S "${alive_urls}" \
+            -t 20 \
+            -d 3 \
+            --js \
+            --sitemap \
+            --robots \
+            -o "${gospider_out}" \
+            2>/dev/null || true
+
+        # Extract clean URLs from gospider's decorated output format
+        find "${gospider_out}" -type f -exec cat {} \; 2>/dev/null \
+            | sed -n 's/.*\(https\?:\/\/[^ ]*\).*/\1/p' \
+            | grep -E '^https?://' \
+            > "${disc_dir}/gospider_raw.txt" 2>/dev/null || true
+        spinner_stop
+        log_sub_ok "gospider → $(count_lines "${disc_dir}/gospider_raw.txt") URLs"
+    fi
+
+    # ── paramspider ───────────────────────────────────────────────────────────
+    if check_tool "paramspider"; then
+        log_sub "paramspider …"
+        spinner_start "paramspider mining parameterised URLs…"
+        paramspider \
+            -d "${TARGET_DOMAIN}" \
+            -o "${disc_dir}/paramspider_raw.txt" \
+            2>/dev/null || true
+        spinner_stop
+        log_sub_ok "paramspider → $(count_lines "${disc_dir}/paramspider_raw.txt") URLs"
+    fi
+
+    # ── MERGE (methodology step 4: anew dedup) ────────────────────────────────
+    log_info "Merging all URL sources (Step 4 anew merge) …"
+
+    {
+        for src in wb_raw gau_raw gauplus_raw waymore_raw \
+                   hakrawler_raw katana_raw gospider_raw paramspider_raw; do
+            [[ -f "${disc_dir}/${src}.txt" ]] && cat "${disc_dir}/${src}.txt"
+        done
+    } | grep -E '^https?://' | grep -v '^$' | sort > "${all_raw}" || true
 
     if [[ ! -s "${all_raw}" ]]; then
-        log_warn "No historical URLs collected. Both gau and waybackurls may be missing."
+        log_warn "No URLs collected from any source."
         mark_done "urldiscovery"
         return 0
     fi
 
-    # ── Clean + filter URLs ───────────────────────────────────────────────────
-    # Remove static/binary asset extensions that are noise for bug bounty
-    local noise_exts="jpg|jpeg|gif|png|svg|ico|ttf|woff|woff2|eot|mp4|mp3|webp|zip|tar|gz"
+    # Deduplicate with anew or sort -u
+    local all_clean="${disc_dir}/all_urls_clean.txt"
+    if check_tool "anew"; then
+        touch "${all_clean}"
+        anew "${all_clean}" < "${all_raw}" > /dev/null
+    else
+        local noise="jpg|jpeg|gif|png|svg|ico|ttf|woff|woff2|eot|mp4|mp3|webp"
+        sort -u "${all_raw}" \
+            | grep -vE "\.(${noise})(\?.*)?$" \
+            > "${all_clean}" || true
+    fi
 
-    sort -u "${all_raw}" \
-        | grep -vE "\.(${noise_exts})(\?.*)?$" \
-        | grep -E "^https?://" \
-        > "${disc_dir}/all_urls_clean.txt" 2>/dev/null || true
+    META_COUNTS[total_urls]="$(count_lines "${all_clean}")"
+    log_ok "Total unique URLs: ${C_BOLD}${META_COUNTS[total_urls]}${C_RESET} → ${all_clean}"
 
-    # Extract URLs with query parameters (high-value for injection testing)
-    grep '?' "${disc_dir}/all_urls_clean.txt" \
-        > "${disc_dir}/urls_params.txt" 2>/dev/null || true
+    # Extract parameterised URLs
+    grep '?' "${all_clean}" > "${disc_dir}/urls_params.txt" 2>/dev/null || true
+    log_ok "URLs with parameters: ${C_BOLD}$(count_lines "${disc_dir}/urls_params.txt")${C_RESET} → urls_params.txt"
 
-    META_COUNTS[historical_urls]="$(count_lines "${disc_dir}/all_urls_clean.txt")"
-    local params_count
-    params_count="$(count_lines "${disc_dir}/urls_params.txt")"
+    # ── CATEGORY FILTERING (methodology §4 extract-interesting) ───────────────
+    log_info "Applying category filters …"
 
-    log_ok "Clean historical URLs: ${C_BOLD}${META_COUNTS[historical_urls]}${C_RESET}"
-    log_ok "URLs with parameters:  ${C_BOLD}${params_count}${C_RESET} (saved to urls_params.txt)"
+    # Helper: filter all_clean by pattern → output file; log count
+    _cat_filter() {
+        local label="$1" pattern="$2" outfile="${cats_dir}/$3"
+        grep -iE "${pattern}" "${all_clean}" 2>/dev/null | sort -u > "${outfile}" || true
+        log_sub_ok "${label}: ${C_BOLD}$(count_lines "${outfile}")${C_RESET} → categories/$3"
+    }
+
+    _cat_filter "JS files"             '\.js(\?|$)'                                                           "js_urls.txt"
+    _cat_filter "PHP files"            '\.php(\?|$)'                                                          "php_files.txt"
+    _cat_filter "ASP/ASPX files"       '\.aspx?(\?|$)'                                                        "asp_files.txt"
+    _cat_filter "JSP/JSPX files"       '\.jspx?(\?|$)'                                                        "jsp_files.txt"
+    _cat_filter "API (JSON/XML/GQL)"   '\.(json|xml|graphql|gql)(\?|$)'                                       "api_endpoints.txt"
+    _cat_filter "Login/Auth flows"     'login|signin|auth|oauth|reset|password'                                "login_flows.txt"
+    _cat_filter "Upload endpoints"     'upload|file|download|image|media'                                      "file_uploads.txt"
+    _cat_filter "Admin panels"         'admin|dashboard|internal|manage|panel'                                  "admin_panels.txt"
+    _cat_filter "Sensitive files"      '\.(env|bak|config|sql|log|pem|key|crt)(\?|$)'                          "sensitive_files.txt"
+    _cat_filter "IDOR candidates"      '[0-9]{2,}'                                                             "idor_targets.txt"
+    _cat_filter "Interesting endpoints" 'admin|login|signup|redirect|callback|auth|dev|test|beta|debug|staging|url=|r=|u=|goto=|return=|dest=' "interesting.txt"
+    _cat_filter "Cloud/secret leaks"   'aws|s3|bucket|gcp|azure|vault|token|apikey|secret'                    "cloud_leaks.txt"
+    _cat_filter "Injection params (=)" '='                                                                     "injection_params.txt"
+
+    # Advanced Wayback sensitive-extension grep (full pattern from methodology)
+    log_sub "Wayback sensitive extension grep …"
+    grep -E \
+        '\.xls|\.xlsx|\.csv|\.sql|\.db|\.bak|\.backup|\.old|\.tar\.gz|\.tgz|\.zip|\.7z|\.rar|\.pdf|\.doc|\.docx|\.pptx|\.txt|\.log|\.ini|\.conf|\.config|\.env|\.json|\.xml|\.yml|\.yaml|\.pem|\.key|\.crt|\.ssh|\.git|\.htaccess|\.htpasswd|\.php|\.swp|\.swo|\.dump|\.dmp|\.ds_store|\.npmrc|\.dockerignore|\.gitignore|\.gitconfig|\.eslintrc|\.prettierrc|\.stylelintrc|\.dockerfile|\.docker-compose|\.circleci|\.travis|\.vscode|\.idea' \
+        "${all_clean}" 2>/dev/null | sort -u \
+        > "${cats_dir}/wayback_sensitive.txt" || true
+    log_sub_ok "Wayback sensitive: ${C_BOLD}$(count_lines "${cats_dir}/wayback_sensitive.txt")${C_RESET} matches"
+
+    local cat_total
+    cat_total="$(cat "${cats_dir}"/*.txt 2>/dev/null | sort -u | wc -l | tr -d ' ')"
+    META_COUNTS[url_categories]="${cat_total}"
+
+    # ── httpx: probe URL list for liveness ────────────────────────────────────
+    if check_tool "httpx"; then
+        log_info "Probing all URLs for liveness with ${C_BOLD}httpx${C_RESET} (-threads 200) …"
+        spinner_start "httpx filtering live URLs…"
+        cat "${all_clean}" | httpx \
+            -status-code \
+            -content-length \
+            -silent \
+            -threads 200 \
+            -o "${disc_dir}/live_urls.txt" \
+            2>/dev/null || true
+        spinner_stop
+        log_ok "Live URLs confirmed: ${C_BOLD}$(count_lines "${disc_dir}/live_urls.txt")${C_RESET} → live_urls.txt"
+    fi
 
     mark_done "urldiscovery"
     notify_module "URL Discovery" "✅ Completed" \
-        "Clean URLs: ${META_COUNTS[historical_urls]} | With params: ${params_count}" \
+        "Total URLs: ${META_COUNTS[total_urls]} | Categorised: ${META_COUNTS[url_categories]}" \
         "$(elapsed_since "${t0}")"
     log_ok "URL Discovery module finished.  [${C_DIM}$(elapsed_since "${t0}")${C_RESET}]"
 }
@@ -877,17 +1211,28 @@ module_url_discovery() {
 # §12 ─ MODULE: JS FILE ANALYSIS & SECRET SCANNING  (-j)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Pipeline:
-#  1. Extract all .js URLs from historical + alive URL lists.
-#  2. Deduplicate the JS URL list.
-#  3. Run trufflehog (filesystem mode, via wget'd copies) to find secrets.
-#  4. Fall back to `nuclei -t exposures/tokens` if trufflehog is unavailable.
+# TOOLCHAIN (parallel where possible):
+#   1. Collect JS URLs from URL discovery categories + urldiscovery sources
+#   2. subjs  — recursive JS extraction from JS files
+#   3. mantra — fast secret pattern scanning against JS URLs
+#   4. jsecret — deeper JS secret scanning
+#   5. jsleak  — xargs -P 20 parallel execution (from methodology)
+#   6. Regex grep — api[_-]?key|token|secret|password patterns
+#   7. trufflehog filesystem — verified secret detection on downloaded JS
+#   8. lazyegg — JS URL/domain/IP extraction
+#   9. nuclei fallback — if trufflehog unavailable
 #
-# Output files:
-#   js/js_urls.txt              Unique JS file URLs
-#   js/js_files/                Downloaded JS files for local scanning
-#   js/trufflehog_findings.json trufflehog JSON output
-#   js/nuclei_js_findings.txt   nuclei secret exposure results (fallback)
+# OUTPUT FILES:
+#   js/js_urls.txt                   Master JS URL list
+#   js/subjs_found.txt               Additional JS URLs found by subjs
+#   js/mantra_secrets.txt            mantra pattern hits
+#   js/jsecret_output.txt            jsecret findings
+#   js/jsleak_output.txt             jsleak parallel output
+#   js/regex_secrets.txt             grep-based secret hits
+#   js/lazyegg_output.txt            lazyegg JS analysis
+#   js/files/                        Downloaded JS files for local scan
+#   js/trufflehog_findings.json      trufflehog JSON output
+#   js/nuclei_js_findings.txt        nuclei fallback output
 # ──────────────────────────────────────────────────────────────────────────────
 module_js_secrets() {
     log_section "MODULE ─ JS File Analysis & Secret Scanning  [-j]"
@@ -898,22 +1243,31 @@ module_js_secrets() {
 
     local t0; t0="$(date +%s)"
     local js_dir="${OUTPUT_BASE_DIR}/js"
+    local js_files_dir="${js_dir}/files"
     local js_urls="${js_dir}/js_urls.txt"
+    local cats_dir="${OUTPUT_BASE_DIR}/urldiscovery/categories"
     local disc_clean="${OUTPUT_BASE_DIR}/urldiscovery/all_urls_clean.txt"
     local alive_urls="${OUTPUT_BASE_DIR}/urls/alive_urls.txt"
 
-    # ── Extract JS URLs from available URL sources ────────────────────────────
-    log_info "Extracting .js URLs from URL lists..."
+    mkdir -p "${js_files_dir}"
+
+    # ── Collect JS URLs from all available sources ────────────────────────────
+    log_info "Collecting JS URLs from all available URL sources …"
     touch "${js_urls}"
 
-    # Pull JS URLs from every available source and deduplicate
     {
-        [[ -s "${disc_clean}" ]] && grep -iE '\.js(\?.*)?$' "${disc_clean}" || true
-        [[ -s "${alive_urls}" ]] && grep -iE '\.js(\?.*)?$' "${alive_urls}" || true
-    } | sort -u | grep -E '^https?://' > "${js_urls}" 2>/dev/null || true
+        # Category-filtered JS list (preferred — already deduplicated)
+        [[ -s "${cats_dir}/js_urls.txt" ]] && cat "${cats_dir}/js_urls.txt"
+        # Fallback: grep from full clean URL list
+        [[ -s "${disc_clean}" ]] && \
+            grep -iE '\.js(\?.*)?$' "${disc_clean}" | grep -ivE '\.json'
+        # Also grep alive_urls in case -u was not run
+        [[ -s "${alive_urls}" ]] && \
+            grep -iE '\.js(\?.*)?$' "${alive_urls}" | grep -ivE '\.json'
+    } | grep -E '^https?://' | sort -u > "${js_urls}" 2>/dev/null || true
 
     META_COUNTS[js_files]="$(count_lines "${js_urls}")"
-    log_ok "Unique JS file URLs found: ${C_BOLD}${META_COUNTS[js_files]}${C_RESET}"
+    log_ok "Unique JS URLs: ${C_BOLD}${META_COUNTS[js_files]}${C_RESET} → js/js_urls.txt"
 
     if [[ "${META_COUNTS[js_files]}" -eq 0 ]]; then
         log_warn "No JS URLs found. Run -r and/or -u modules first."
@@ -921,61 +1275,123 @@ module_js_secrets() {
         return 0
     fi
 
-    # ── trufflehog branch ─────────────────────────────────────────────────────
-    if check_tool "trufflehog"; then
-        log_info "Running ${C_BOLD}trufflehog${C_RESET} against JS URLs..."
-
-        # trufflehog v3 supports scanning directly from a list of URLs
-        # using its 'filesystem' or 'git' source. We use the 'filesystem'
-        # source on a directory of downloaded JS files.
-        local js_files_dir="${js_dir}/js_files"
-        mkdir -p "${js_files_dir}"
-
-        log_info "Downloading JS files for local analysis..."
-        spinner_start "wget fetching JS files…"
-
-        # Download each JS file, preserving a flat structure
-        local dl_count=0
-        while IFS= read -r js_url; do
-            [[ -z "${js_url}" ]] && continue
-            # Sanitize URL into a filename
-            local safe_fn
-            safe_fn="$(echo "${js_url}" | md5sum | awk '{print $1}').js"
-            wget -q --timeout=10 --tries=2 \
-                -O "${js_files_dir}/${safe_fn}" \
-                "${js_url}" 2>/dev/null || true
-            (( dl_count++ )) || true
-        done < "${js_urls}"
-
+    # ── 1. subjs — recursive JS discovery ─────────────────────────────────────
+    if check_tool "subjs"; then
+        log_sub "subjs (recursive JS extraction) …"
+        spinner_start "subjs finding more JS files…"
+        cat "${js_urls}" | subjs \
+            > "${js_dir}/subjs_found.txt" 2>/dev/null || true
         spinner_stop
-        log_ok "Downloaded ${dl_count} JS files to ${js_files_dir}/"
 
-        # Run trufflehog on the downloaded JS directory
-        log_info "Scanning JS files with ${C_BOLD}trufflehog${C_RESET}..."
-        spinner_start "trufflehog scanning for secrets…"
+        # Feed subjs results back into the master JS URL list
+        if [[ -s "${js_dir}/subjs_found.txt" ]]; then
+            if check_tool "anew"; then
+                anew "${js_urls}" < "${js_dir}/subjs_found.txt" > /dev/null
+            else
+                cat "${js_dir}/subjs_found.txt" >> "${js_urls}"
+                sort -u -o "${js_urls}" "${js_urls}"
+            fi
+            META_COUNTS[js_files]="$(count_lines "${js_urls}")"
+        fi
+        log_sub_ok "subjs → $(count_lines "${js_dir}/subjs_found.txt") additional JS URLs (total: ${META_COUNTS[js_files]})"
+    fi
 
+    # ── 2. mantra — fast pattern scanning ─────────────────────────────────────
+    if check_tool "mantra"; then
+        log_sub "mantra (JS secret pattern scanning) …"
+        spinner_start "mantra scanning JS for secrets…"
+        cat "${js_urls}" | mantra \
+            > "${js_dir}/mantra_secrets.txt" 2>/dev/null || true
+        spinner_stop
+        log_sub_ok "mantra → $(count_lines "${js_dir}/mantra_secrets.txt") findings"
+    fi
+
+    # ── 3. jsecret ─────────────────────────────────────────────────────────────
+    if check_tool "jsecret"; then
+        log_sub "jsecret …"
+        spinner_start "jsecret scanning…"
+        cat "${js_urls}" | jsecret \
+            > "${js_dir}/jsecret_output.txt" 2>/dev/null || true
+        spinner_stop
+        log_sub_ok "jsecret → $(count_lines "${js_dir}/jsecret_output.txt") findings"
+    fi
+
+    # ── 4. jsleak — xargs -P 20 parallel (exact methodology flags) ────────────
+    if check_tool "jsleak"; then
+        log_sub "jsleak (-P 20 parallel, -s -l -k -e) …"
+        spinner_start "jsleak parallel scanning (20 workers)…"
+        # Exact command from methodology: xargs -P 20 -I {} jsleak -s -l -k -e {}
+        cat "${js_urls}" | xargs -P 20 -I {} \
+            bash -c 'jsleak -s -l -k -e "$1" 2>/dev/null' _ {} \
+            >> "${js_dir}/jsleak_output.txt" 2>/dev/null || true
+        spinner_stop
+        log_sub_ok "jsleak → $(count_lines "${js_dir}/jsleak_output.txt") findings"
+    fi
+
+    # ── 5. Regex secret grep (methodology pattern) ────────────────────────────
+    log_sub "Regex secret grep (api_key|token|secret|password) …"
+    spinner_start "curl+grep fetching and scanning JS content…"
+    cat "${js_urls}" | xargs -P 10 -I {} \
+        bash -c '
+            content=$(curl -sk --max-time 15 "$1" 2>/dev/null)
+            matches=$(echo "$content" | grep -oE "(api[_-]?key|apikey|token|secret|password|auth_token|access_token|bearer|private_key)[\"'"'"'\s:=]+[A-Za-z0-9+/=_\-\.]{8,}" 2>/dev/null)
+            [[ -n "$matches" ]] && echo "$matches" | sed "s|^|[$1] |"
+        ' _ {} \
+        > "${js_dir}/regex_secrets.txt" 2>/dev/null || true
+    spinner_stop
+    log_sub_ok "Regex grep → $(count_lines "${js_dir}/regex_secrets.txt") potential secret lines"
+
+    # ── 6. lazyegg ────────────────────────────────────────────────────────────
+    if check_tool "lazyegg" && command -v python3 &>/dev/null; then
+        log_sub "lazyegg (parallel -P 10) …"
+        spinner_start "lazyegg extracting JS metadata…"
+        cat "${js_urls}" | xargs -P 10 -I {} \
+            bash -c 'python3 lazyegg.py "$1" --js_urls --domains --ips 2>/dev/null' _ {} \
+            >> "${js_dir}/lazyegg_output.txt" 2>/dev/null || true
+        spinner_stop
+        log_sub_ok "lazyegg → $(count_lines "${js_dir}/lazyegg_output.txt") lines"
+    fi
+
+    # ── 7. Download JS files for local analysis ────────────────────────────────
+    log_sub "Downloading JS files for trufflehog local scan …"
+    spinner_start "wget fetching JS files…"
+    local dl_count=0
+    while IFS= read -r js_url; do
+        [[ -z "${js_url}" ]] && continue
+        local safe_fn
+        safe_fn="$(echo "${js_url}" | md5sum | awk '{print $1}').js"
+        wget -q --timeout=10 --tries=2 \
+            -O "${js_files_dir}/${safe_fn}" \
+            "${js_url}" 2>/dev/null || true
+        (( dl_count++ )) || true
+    done < "${js_urls}"
+    spinner_stop
+    log_sub_ok "Downloaded ${dl_count} JS files → js/files/"
+
+    # ── 8. trufflehog filesystem scan (primary) ────────────────────────────────
+    if check_tool "trufflehog"; then
+        log_sub "trufflehog filesystem scan …"
+        spinner_start "trufflehog scanning for verified secrets…"
         trufflehog filesystem \
             "${js_files_dir}" \
             --json \
             --no-verification \
             2>/dev/null \
             > "${js_dir}/trufflehog_findings.json" || true
-
         spinner_stop
 
         META_COUNTS[secrets]="$(count_lines "${js_dir}/trufflehog_findings.json")"
         if [[ "${META_COUNTS[secrets]}" -gt 0 ]]; then
-            log_ok "${C_BRED}⚠  trufflehog found ${META_COUNTS[secrets]} potential secret(s)!${C_RESET}"
-            log_info "Results: ${js_dir}/trufflehog_findings.json"
+            log_ok "${C_BRED}⚠  trufflehog: ${META_COUNTS[secrets]} potential secret(s) detected!${C_RESET}"
+            log_info "Review: ${js_dir}/trufflehog_findings.json"
         else
-            log_info "trufflehog: No secrets detected."
+            log_sub_ok "trufflehog: No verified secrets detected."
         fi
 
-    # ── nuclei fallback branch ────────────────────────────────────────────────
+    # ── 9. nuclei fallback ─────────────────────────────────────────────────────
     elif check_tool "nuclei"; then
-        log_warn "trufflehog not found — falling back to ${C_BOLD}nuclei exposures/tokens${C_RESET}..."
-        spinner_start "nuclei scanning JS for secret tokens…"
-
+        log_warn "trufflehog not found — falling back to ${C_BOLD}nuclei exposures/tokens${C_RESET}"
+        spinner_start "nuclei scanning JS for token exposures…"
         nuclei \
             -l "${js_urls}" \
             -tags "token,exposure,api-key,secret" \
@@ -983,22 +1399,29 @@ module_js_secrets() {
             -silent \
             -o "${js_dir}/nuclei_js_findings.txt" \
             2>/dev/null || true
-
         spinner_stop
 
         META_COUNTS[secrets]="$(count_lines "${js_dir}/nuclei_js_findings.txt")"
         if [[ "${META_COUNTS[secrets]}" -gt 0 ]]; then
-            log_ok "${C_BRED}⚠  nuclei found ${META_COUNTS[secrets]} secret exposure(s)!${C_RESET}"
-        else
-            log_info "nuclei JS scan: No secret exposures detected."
+            log_ok "${C_BRED}⚠  nuclei JS: ${META_COUNTS[secrets]} exposure(s) found!${C_RESET}"
         fi
     else
-        log_warn "Neither trufflehog nor nuclei found. Cannot perform secret scanning."
+        log_warn "Neither trufflehog nor nuclei found. Cannot run deep secret scanning."
     fi
+
+    # Tally total findings across all tools
+    local total_findings
+    total_findings=$(( \
+        $(count_lines "${js_dir}/mantra_secrets.txt") + \
+        $(count_lines "${js_dir}/jsleak_output.txt") + \
+        $(count_lines "${js_dir}/regex_secrets.txt") + \
+        ${META_COUNTS[secrets]} \
+    ))
+    META_COUNTS[secrets]="${total_findings}"
 
     mark_done "jssecrets"
     notify_module "JS & Secrets" "✅ Completed" \
-        "JS files: ${META_COUNTS[js_files]} | Secrets found: ${META_COUNTS[secrets]}" \
+        "JS files: ${META_COUNTS[js_files]} | Total findings: ${total_findings}" \
         "$(elapsed_since "${t0}")"
     log_ok "JS & Secrets module finished.  [${C_DIM}$(elapsed_since "${t0}")${C_RESET}]"
 }
@@ -1007,21 +1430,18 @@ module_js_secrets() {
 # §13 ─ MODULE: HIDDEN PARAMETER DISCOVERY  (-p)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Runs arjun against a curated subset of alive URLs to discover undocumented
-# GET and POST parameters. These are extremely valuable for SQLi, XSS, IDOR,
-# and SSRF testing.
+# APPROACH:
+#   1. arjun (GET + POST) on curated target list (methodology §param-discovery)
+#   2. qsreplace FUZZ — build injection-ready URL list from all param URLs
+#   3. param key extraction: sed 's/=[^&]*/=/g'
 #
-# Filtering logic before arjun:
-#   - Take alive_urls.txt
-#   - Prefer URLs that already have a query string (likely parameterised pages)
-#   - Cap at MAX_ARJUN_TARGETS to prevent runaway scanning
-#
-# Output files:
-#   params/arjun_findings.json   arjun JSON output (per-URL parameter map)
-#   params/params_summary.txt    Human-readable summary (URL + found params)
+# OUTPUT FILES:
+#   params/arjun_targets.txt      URL list fed to arjun
+#   params/arjun_findings.json    arjun JSON results
+#   params/params_summary.txt     Human-readable arjun summary
+#   params/params_fuzz.txt        qsreplace FUZZ-ready URLs
+#   params/param_keys.txt         Parameter key names (no values)
 # ──────────────────────────────────────────────────────────────────────────────
-
-# Maximum number of URLs fed into arjun (tune based on programme scope)
 readonly MAX_ARJUN_TARGETS=100
 
 module_hidden_params() {
@@ -1035,30 +1455,29 @@ module_hidden_params() {
     local params_dir="${OUTPUT_BASE_DIR}/params"
     local urls_dir="${OUTPUT_BASE_DIR}/urls"
     local disc_dir="${OUTPUT_BASE_DIR}/urldiscovery"
-
-    # ── Build the arjun target list ────────────────────────────────────────────
+    local cats_dir="${disc_dir}/categories"
     local arjun_targets="${params_dir}/arjun_targets.txt"
+
     touch "${arjun_targets}"
 
-    # Priority 1: URLs with existing query params (already parameterised endpoints)
+    # ── Build arjun target list ────────────────────────────────────────────────
+    # Priority 1: parameterised URLs from URL discovery
     if [[ -s "${disc_dir}/urls_params.txt" ]]; then
         head -n "${MAX_ARJUN_TARGETS}" "${disc_dir}/urls_params.txt" \
             >> "${arjun_targets}"
-        log_info "Loaded $(count_lines "${arjun_targets}") URLs with existing params from URL discovery."
+    fi
+    # Priority 2: injection candidates from category filter
+    if [[ -s "${cats_dir}/injection_params.txt" ]]; then
+        head -n "${MAX_ARJUN_TARGETS}" "${cats_dir}/injection_params.txt" \
+            >> "${arjun_targets}"
+    fi
+    # Priority 3: fill remaining slots with plain alive URLs
+    local remaining=$(( MAX_ARJUN_TARGETS - $(count_lines "${arjun_targets}") ))
+    if [[ "${remaining}" -gt 0 && -s "${urls_dir}/alive_urls.txt" ]]; then
+        head -n "${remaining}" "${urls_dir}/alive_urls.txt" >> "${arjun_targets}"
     fi
 
-    # Priority 2: Fill remaining slots with plain alive URLs
-    if [[ -s "${urls_dir}/alive_urls.txt" ]]; then
-        local remaining=$(( MAX_ARJUN_TARGETS - $(count_lines "${arjun_targets}") ))
-        if [[ "${remaining}" -gt 0 ]]; then
-            head -n "${remaining}" "${urls_dir}/alive_urls.txt" \
-                >> "${arjun_targets}"
-        fi
-    fi
-
-    # Final dedup
     sort -u -o "${arjun_targets}" "${arjun_targets}"
-
     local target_count
     target_count="$(count_lines "${arjun_targets}")"
 
@@ -1068,38 +1487,26 @@ module_hidden_params() {
         return 0
     fi
 
-    check_required_tool "arjun"
+    # ── arjun ─────────────────────────────────────────────────────────────────
+    if check_tool "arjun"; then
+        log_info "Running ${C_BOLD}arjun${C_RESET} (GET + POST) on ${target_count} URLs …"
+        spinner_start "arjun discovering hidden parameters…"
+        arjun \
+            -i "${arjun_targets}" \
+            -oJ "${params_dir}/arjun_findings.json" \
+            -m GET POST \
+            -t 10 \
+            --passive \
+            2>/dev/null || true
+        spinner_stop
 
-    log_info "Running ${C_BOLD}arjun${C_RESET} against ${target_count} target URLs..."
-    log_warn "arjun can be slow; sending ~$((target_count * 2)) requests per URL."
+        # Python summary parser (identical to original v3 logic)
+        local findings_count=0
+        local arjun_json="${params_dir}/arjun_findings.json"
+        local arjun_summary="${params_dir}/params_summary.txt"
 
-    # arjun flags:
-    #   -i  : input file of URLs
-    #   -oJ : JSON output file
-    #   -m  : methods to test (GET and POST)
-    #   -t  : threads
-    #   --passive : use passive sources where possible to reduce noise
-    spinner_start "arjun discovering hidden parameters…"
-
-    arjun \
-        -i "${arjun_targets}" \
-        -oJ "${params_dir}/arjun_findings.json" \
-        -m GET POST \
-        -t 5 \
-        --passive \
-        2>/dev/null || true
-
-    spinner_stop
-
-    # ── Parse and summarise arjun JSON output ─────────────────────────────────
-    # We pass the file path via an environment variable so Python receives it
-    # even though the heredoc uses single-quoted (non-interpolating) PYEOF.
-    local findings_count=0
-    local arjun_json="${params_dir}/arjun_findings.json"
-    local arjun_summary="${params_dir}/params_summary.txt"
-
-    if [[ -s "${arjun_json}" ]] && command -v python3 &>/dev/null; then
-        findings_count="$(ARJUN_JSON="${arjun_json}" python3 - <<'PYEOF'
+        if [[ -s "${arjun_json}" ]] && command -v python3 &>/dev/null; then
+            findings_count="$(ARJUN_JSON="${arjun_json}" python3 - <<'PYEOF'
 import json, os, sys
 try:
     path = os.environ["ARJUN_JSON"]
@@ -1110,10 +1517,9 @@ try:
 except Exception:
     print(0)
 PYEOF
-        )" 2>/dev/null || findings_count=0
+            )" 2>/dev/null || findings_count=0
 
-        # Write human-readable summary
-        ARJUN_JSON="${arjun_json}" python3 - > "${arjun_summary}" 2>/dev/null || true <<'PYEOF'
+            ARJUN_JSON="${arjun_json}" python3 - > "${arjun_summary}" 2>/dev/null || true <<'PYEOF'
 import json, os
 try:
     path = os.environ["ARJUN_JSON"]
@@ -1127,20 +1533,47 @@ try:
 except Exception as e:
     print(f"Parse error: {e}")
 PYEOF
+        fi
+
+        META_COUNTS[hidden_params]="${findings_count}"
+        if [[ "${findings_count}" -gt 0 ]]; then
+            log_ok "${C_BRED}⚠  arjun: ${findings_count} hidden parameter(s) discovered!${C_RESET}"
+            log_info "Summary: ${params_dir}/params_summary.txt"
+        else
+            log_info "arjun: No hidden parameters found."
+        fi
+    else
+        log_warn "arjun not found — skipping hidden param brute-force."
     fi
 
-    META_COUNTS[hidden_params]="${findings_count}"
+    # ── qsreplace FUZZ-ready list (methodology §param) ────────────────────────
+    if check_tool "qsreplace"; then
+        log_sub "qsreplace FUZZ — building injection-ready URL list …"
+        if [[ -s "${disc_dir}/urls_params.txt" ]]; then
+            if check_tool "anew"; then
+                cat "${disc_dir}/urls_params.txt" \
+                    | qsreplace "FUZZ" \
+                    | anew "${params_dir}/params_fuzz.txt" > /dev/null 2>/dev/null || true
+            else
+                cat "${disc_dir}/urls_params.txt" \
+                    | qsreplace "FUZZ" \
+                    | sort -u > "${params_dir}/params_fuzz.txt" 2>/dev/null || true
+            fi
+            log_sub_ok "FUZZ-ready URLs: ${C_BOLD}$(count_lines "${params_dir}/params_fuzz.txt")${C_RESET} → params/params_fuzz.txt"
+        fi
+    fi
 
-    if [[ "${findings_count}" -gt 0 ]]; then
-        log_ok "${C_BRED}⚠  arjun discovered ${findings_count} hidden parameter(s)!${C_RESET}"
-        log_info "See ${params_dir}/params_summary.txt for the full breakdown."
-    else
-        log_info "arjun: No hidden parameters discovered."
+    # ── Parameter key extraction (sed pattern from methodology) ───────────────
+    if [[ -s "${disc_dir}/urls_params.txt" ]]; then
+        log_sub "Extracting parameter key names …"
+        sed 's/=[^&]*/=/g' "${disc_dir}/urls_params.txt" \
+            | sort -u > "${params_dir}/param_keys.txt" 2>/dev/null || true
+        log_sub_ok "Unique param keys: ${C_BOLD}$(count_lines "${params_dir}/param_keys.txt")${C_RESET} → params/param_keys.txt"
     fi
 
     mark_done "hiddenparams"
     notify_module "Hidden Params" "✅ Completed" \
-        "Scanned: ${target_count} URLs | Hidden params found: ${findings_count}" \
+        "Scanned: ${target_count} URLs | Hidden params: ${META_COUNTS[hidden_params]}" \
         "$(elapsed_since "${t0}")"
     log_ok "Hidden Params module finished.  [${C_DIM}$(elapsed_since "${t0}")${C_RESET}]"
 }
@@ -1149,14 +1582,34 @@ PYEOF
 # §14 ─ MODULE: ACTIVE FUZZING  (-f)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Runs ffuf against every alive host, feeding the user-supplied wordlist.
-# Auto-calibration (-ac) removes false positives without manual filter tuning.
+# THREE-STAGE FUZZING PIPELINE:
 #
-# Output files:
-#   fuzzing/<sanitized_host>_fuzz.json   per-host ffuf JSON results
+#   Stage A — Directory Fuzzing (ffuf)
+#     • Per-host directory brute-force with extension expansion
+#     • Flags: -t 200 -ac -mc 200,204,301,302,307,401,403,405 -fs 0
+#     • Extensions: php,html,json,js,log,txt,bak,old,zip,tar,gz,asp,aspx,config,env,xml
+#
+#   Stage B — VHost Fuzzing (ffuf)
+#     • Host-header injection: ffuf -H "Host: FUZZ.target.com"
+#     • IP-based probe (if resolvable): ffuf -u http://<ip> -H "Host: FUZZ.target.com"
+#     • Subdomain prefix patterns: FUZZ.target.com, FUZZ-target.com
+#
+#   Stage C — Deep Directory Scanning (feroxbuster)
+#     • Recursive depth-3 scan on top alive hosts
+#     • Flags: -t 300 -k -d 3 -e (auto-expand extensions)
+#
+# OUTPUT FILES:
+#   fuzzing/<host>_dir.json             ffuf directory results (per host)
+#   fuzzing/vhost/vhost_hostinject.json ffuf vhost header-injection results
+#   fuzzing/vhost/sub_prefix_*.json     Subdomain prefix pattern results
+#   fuzzing/<host>_ferox.txt            feroxbuster output (per host)
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Cap: fuzz only the first N alive hosts to avoid runaway runtimes
+readonly MAX_FUZZ_HOSTS=20
+
 module_fuzzing() {
-    log_section "MODULE ─ Active Directory & Endpoint Fuzzing  [-f]"
+    log_section "MODULE ─ Active Directory, VHost & Deep Fuzzing  [-f]"
 
     local decision
     decision="$(check_resume "fuzzing" "Fuzzing")"
@@ -1164,13 +1617,15 @@ module_fuzzing() {
 
     local t0; t0="$(date +%s)"
     local fuzzing_dir="${OUTPUT_BASE_DIR}/fuzzing"
+    local vhost_dir="${fuzzing_dir}/vhost"
     local alive_urls="${OUTPUT_BASE_DIR}/urls/alive_urls.txt"
+    local all_subs="${OUTPUT_BASE_DIR}/subdomains/all_subs.txt"
 
     validate_file "${WORDLIST_FILE}" "fuzzing wordlist"
     check_required_tool "ffuf"
 
     if [[ ! -s "${alive_urls}" ]]; then
-        log_warn "No alive URLs at '${alive_urls}'. Run -r (Recon) first."
+        log_warn "No alive URLs. Run -r (Recon) first."
         log_skip "Skipping Fuzzing module."
         return 0
     fi
@@ -1178,43 +1633,36 @@ module_fuzzing() {
     local url_count wl_count
     url_count="$(count_lines "${alive_urls}")"
     wl_count="$(count_lines "${WORDLIST_FILE}")"
-    log_info "Fuzzing ${C_BOLD}${url_count}${C_RESET} hosts | Wordlist: ${C_BOLD}${wl_count}${C_RESET} entries"
+    local fuzz_count=$(( url_count < MAX_FUZZ_HOSTS ? url_count : MAX_FUZZ_HOSTS ))
+
+    log_info "Fuzzing ${C_BOLD}${fuzz_count}${C_RESET} hosts (cap: ${MAX_FUZZ_HOSTS}) | Wordlist: ${C_BOLD}${wl_count}${C_RESET} entries"
 
     local total_hits=0
+    local ext="php,html,json,js,log,txt,bak,old,zip,tar,gz,asp,aspx,config,env,xml,jsp,cfm,cgi"
 
-    while IFS= read -r target_url; do
+    # ── STAGE A: ffuf directory fuzzing ───────────────────────────────────────
+    log_info "${C_BOLD}Stage A${C_RESET} — ffuf directory fuzzing (-t 200) …"
+
+    head -n "${MAX_FUZZ_HOSTS}" "${alive_urls}" | while IFS= read -r target_url; do
         [[ -z "${target_url}" ]] && continue
 
         local safe_name
         safe_name="$(echo "${target_url}" \
-            | sed 's|https\?://||g' \
-            | tr '/.:@' '____' \
-            | tr -cd '[:alnum:]_-')"
+            | sed 's|https\?://||g' | tr '/.:@' '____' | tr -cd '[:alnum:]_-')"
+        local out_file="${fuzzing_dir}/${safe_name}_dir.json"
 
-        local out_file="${fuzzing_dir}/${safe_name}_fuzz.json"
+        log_sub "ffuf dir: ${C_CYAN}${target_url}${C_RESET}"
 
-        log_info "Fuzzing: ${C_CYAN}${target_url}${C_RESET}"
-
-        # ffuf flags:
-        #   -u        URL with FUZZ keyword as path segment
-        #   -w        wordlist
-        #   -ac       auto-calibrate (removes false-positive response sizes)
-        #   -mc       match HTTP codes of interest
-        #   -fs 0     filter zero-byte responses
-        #   -o        output file
-        #   -of json  JSON format for structured parsing
-        #   -t 40     goroutine threads
-        #   -timeout  per-request timeout
-        #   -silent   no per-request console output
         ffuf \
             -u "${target_url}/FUZZ" \
             -w "${WORDLIST_FILE}" \
+            -t 200 \
             -ac \
             -mc 200,204,301,302,307,401,403,405 \
             -fs 0 \
+            -e ".${ext//,/.,.}" \
             -o "${out_file}" \
             -of json \
-            -t 40 \
             -timeout 10 \
             -silent \
             2>/dev/null || true
@@ -1223,19 +1671,123 @@ module_fuzzing() {
             local hits
             hits="$(jq '.results | length' "${out_file}" 2>/dev/null || echo 0)"
             if [[ "${hits}" -gt 0 ]]; then
-                log_ok "  ↳ ${C_BOLD}${hits}${C_RESET} paths found on ${target_url}"
+                log_sub_ok "${C_BOLD}${hits}${C_RESET} paths found → ${safe_name}_dir.json"
                 (( total_hits += hits )) || true
             fi
         fi
+    done
 
-    done < "${alive_urls}"
+    # ── STAGE B: VHost fuzzing ─────────────────────────────────────────────────
+    log_info "${C_BOLD}Stage B${C_RESET} — ffuf vhost fuzzing (Host header injection) …"
+
+    # B1: Host-header injection on the root domain
+    log_sub "ffuf vhost (Host: FUZZ.${TARGET_DOMAIN}) …"
+    ffuf \
+        -u "https://${TARGET_DOMAIN}" \
+        -w "${WORDLIST_FILE}" \
+        -H "Host: FUZZ.${TARGET_DOMAIN}" \
+        -t 200 \
+        -mc 200,301,302,307,401,403 \
+        -fs 0 \
+        -ac \
+        -o "${vhost_dir}/vhost_hostinject.json" \
+        -of json \
+        -timeout 10 \
+        -silent \
+        2>/dev/null || true
+    log_sub_ok "vhost header-inject → $(
+        command -v jq &>/dev/null \
+        && jq '.results | length' "${vhost_dir}/vhost_hostinject.json" 2>/dev/null \
+        || echo '?') hits"
+
+    # B2: Subdomain prefix patterns from methodology
+    local -a vhost_patterns=(
+        "https://FUZZ.${TARGET_DOMAIN}"
+        "https://FUZZ-${TARGET_DOMAIN}"
+    )
+
+    for pattern in "${vhost_patterns[@]}"; do
+        local safe_pat
+        safe_pat="$(echo "${pattern}" | tr -dc '[:alnum:]_-' | cut -c1-60)"
+        log_sub "ffuf pattern: ${pattern} …"
+        ffuf \
+            -u "${pattern}" \
+            -w "${WORDLIST_FILE}" \
+            -t 200 \
+            -mc 200,301,302,307,401,403 \
+            -fs 0 \
+            -ac \
+            -o "${vhost_dir}/sub_prefix_${safe_pat}.json" \
+            -of json \
+            -timeout 10 \
+            -silent \
+            2>/dev/null || true
+    done
+
+    # B3: 403 bypass with header fuzzing (methodology advanced pattern)
+    if [[ -f "${WORDLIST_FILE}" ]]; then
+        log_sub "ffuf 403 bypass header fuzzing on first 5 hosts …"
+        head -n 5 "${alive_urls}" | while IFS= read -r target_url; do
+            [[ -z "${target_url}" ]] && continue
+            local safe_name
+            safe_name="$(echo "${target_url}" | sed 's|https\?://||g' | tr '/.:@' '____' | tr -cd '[:alnum:]_-')"
+            ffuf \
+                -u "${target_url}/FUZZ" \
+                -w "${WORDLIST_FILE}" \
+                -H "X-Forwarded-For: 127.0.0.1" \
+                -H "X-Original-URL: /FUZZ" \
+                -t 200 \
+                -mc 200,301,302 \
+                -ac \
+                -o "${vhost_dir}/${safe_name}_403bypass.json" \
+                -of json \
+                -timeout 10 \
+                -silent \
+                2>/dev/null || true
+        done
+    fi
+
+    # ── STAGE C: feroxbuster deep recursive scan ───────────────────────────────
+    if check_tool "feroxbuster"; then
+        log_info "${C_BOLD}Stage C${C_RESET} — feroxbuster (-t 300 -d 3 -k -e) on top 10 hosts …"
+
+        head -n 10 "${alive_urls}" | while IFS= read -r target_url; do
+            [[ -z "${target_url}" ]] && continue
+            local safe_name
+            safe_name="$(echo "${target_url}" | sed 's|https\?://||g' | tr '/.:@' '____' | tr -cd '[:alnum:]_-')"
+            log_sub "feroxbuster: ${C_CYAN}${target_url}${C_RESET} …"
+
+            feroxbuster \
+                -u "${target_url}" \
+                -w "${WORDLIST_FILE}" \
+                -t 300 \
+                -k \
+                -d 3 \
+                -e \
+                -x "${ext}" \
+                -o "${fuzzing_dir}/${safe_name}_ferox.txt" \
+                --silent \
+                --no-recursion-limit \
+                2>/dev/null || true
+
+            if [[ -f "${fuzzing_dir}/${safe_name}_ferox.txt" ]]; then
+                local ferox_hits
+                ferox_hits="$(grep -c '200' "${fuzzing_dir}/${safe_name}_ferox.txt" 2>/dev/null || echo 0)"
+                [[ "${ferox_hits}" -gt 0 ]] && \
+                    log_sub_ok "feroxbuster: ${C_BOLD}${ferox_hits}${C_RESET} 200-status paths"
+                (( total_hits += ferox_hits )) || true
+            fi
+        done
+    else
+        log_warn "feroxbuster not found — skipping Stage C deep scan."
+    fi
 
     META_COUNTS[fuzz_hits]="${total_hits}"
     log_ok "Total interesting paths discovered: ${C_BOLD}${total_hits}${C_RESET}"
 
     mark_done "fuzzing"
     notify_module "Fuzzing" "✅ Completed" \
-        "Hosts: ${url_count} | Paths found: ${total_hits}" \
+        "Hosts: ${fuzz_count} | Total hits: ${total_hits}" \
         "$(elapsed_since "${t0}")"
     log_ok "Fuzzing module finished.  [${C_DIM}$(elapsed_since "${t0}")${C_RESET}]"
 }
@@ -1244,12 +1796,14 @@ module_fuzzing() {
 # §15 ─ MODULE: VULNERABILITY SCANNING  (-v)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Runs nuclei with a curated set of template tags targeting high-signal,
-# low-noise vulnerabilities. Severity filtered to medium+ to reduce noise.
+# Runs nuclei against alive_urls.txt with curated template tags.
+# Also feeds category-filtered URLs (admin panels, login flows, sensitive
+# files) as supplementary targets for higher-signal scanning.
 #
 # Output files:
-#   vulns/nuclei_findings.txt    Human-readable nuclei output
-#   vulns/nuclei_findings.json   JSONL machine-readable output
+#   vulns/nuclei_findings.txt     Human-readable nuclei output
+#   vulns/nuclei_findings.json    JSONL machine-readable output
+#   vulns/nuclei_exposures.txt    Exposure-template-specific output
 # ──────────────────────────────────────────────────────────────────────────────
 module_vuln_scan() {
     log_section "MODULE ─ Vulnerability & Takeover Scanning  [-v]"
@@ -1261,6 +1815,7 @@ module_vuln_scan() {
     local t0; t0="$(date +%s)"
     local vulns_dir="${OUTPUT_BASE_DIR}/vulns"
     local alive_urls="${OUTPUT_BASE_DIR}/urls/alive_urls.txt"
+    local cats_dir="${OUTPUT_BASE_DIR}/urldiscovery/categories"
 
     if [[ ! -s "${alive_urls}" ]]; then
         log_warn "No alive URLs at '${alive_urls}'. Run -r (Recon) first."
@@ -1270,33 +1825,40 @@ module_vuln_scan() {
 
     check_required_tool "nuclei"
 
-    local url_count
-    url_count="$(count_lines "${alive_urls}")"
-    log_info "Running ${C_BOLD}nuclei${C_RESET} against ${url_count} hosts..."
+    # Build an enriched target list by appending category-filtered URLs
+    local vuln_targets="${vulns_dir}/vuln_targets.txt"
+    cp "${alive_urls}" "${vuln_targets}" 2>/dev/null || true
+    for extra in admin_panels.txt login_flows.txt sensitive_files.txt interesting.txt; do
+        [[ -f "${cats_dir}/${extra}" ]] && \
+            cat "${cats_dir}/${extra}" >> "${vuln_targets}"
+    done
+    if check_tool "anew"; then
+        sort "${vuln_targets}" | anew "${vuln_targets}" > /dev/null 2>&1 || true
+    else
+        sort -u -o "${vuln_targets}" "${vuln_targets}"
+    fi
 
-    # Update templates (silent – failure is non-fatal)
-    log_info "Refreshing nuclei templates..."
+    local url_count
+    url_count="$(count_lines "${vuln_targets}")"
+    log_info "Running ${C_BOLD}nuclei${C_RESET} against ${url_count} targets …"
+
+    # Update templates (non-fatal)
+    log_info "Refreshing nuclei templates …"
     spinner_start "nuclei updating templates…"
     nuclei -update-templates -silent 2>/dev/null || true
     spinner_stop
     log_ok "Templates up to date."
 
-    # nuclei flags:
-    #   -l       input URL list
-    #   -tags    curated template tag selection
-    #   -severity only medium, high, critical (reduces noise)
-    #   -c       concurrency (parallel hosts)
-    #   -rl      rate limit (req/s)
-    #   -o       text output
-    #   -jsonl   JSONL output for automation
-    #   -silent  suppress banner
-    #   -stats   show progress
     local findings_txt="${vulns_dir}/nuclei_findings.txt"
     local findings_json="${vulns_dir}/nuclei_findings.json"
+    local exposures_txt="${vulns_dir}/nuclei_exposures.txt"
+    local tmpl_root="${NUCLEI_TEMPLATES:-${HOME}/nuclei-templates}"
 
+    # Scan 1: full tag-based scan
+    log_sub "nuclei (takeover|exposure|cve|default-login|misconfig|panel) …"
     spinner_start "nuclei scanning for vulnerabilities…"
     nuclei \
-        -l "${alive_urls}" \
+        -l "${vuln_targets}" \
         -tags "takeover,exposure,cve,default-login,misconfig,panel" \
         -severity "medium,high,critical" \
         -c 25 \
@@ -1308,10 +1870,24 @@ module_vuln_scan() {
         2>/dev/null || true
     spinner_stop
 
+    # Scan 2: exposure templates specifically (methodology §full-vuln-scan)
+    if [[ -d "${tmpl_root}/http/exposures" ]]; then
+        log_sub "nuclei exposures templates …"
+        spinner_start "nuclei scanning http/exposures…"
+        nuclei \
+            -l "${vuln_targets}" \
+            -t "${tmpl_root}/http/exposures" \
+            -silent \
+            -o "${exposures_txt}" \
+            2>/dev/null || true
+        spinner_stop
+        log_sub_ok "Exposures scan → $(count_lines "${exposures_txt}") findings"
+    fi
+
     META_COUNTS[vuln_findings]="$(count_lines "${findings_txt}")"
 
     if [[ "${META_COUNTS[vuln_findings]}" -gt 0 ]]; then
-        log_ok "${C_BRED}⚠  nuclei found ${META_COUNTS[vuln_findings]} potential vulnerabilities!${C_RESET}"
+        log_ok "${C_BRED}⚠  nuclei: ${META_COUNTS[vuln_findings]} potential vulnerabilit(ies) found!${C_RESET}"
         echo ""
         log_info "=== Top findings (first 20) ==="
         head -n 20 "${findings_txt}" | while IFS= read -r line; do
@@ -1319,12 +1895,12 @@ module_vuln_scan() {
         done
         echo ""
     else
-        log_info "Nuclei: No medium+ findings for the selected template tags."
+        log_info "Nuclei: No medium+ findings for selected template tags."
     fi
 
     mark_done "vulnscan"
     notify_module "Vuln Scan" "✅ Completed" \
-        "Hosts: ${url_count} | Findings: ${META_COUNTS[vuln_findings]}" \
+        "Targets: ${url_count} | Findings: ${META_COUNTS[vuln_findings]}" \
         "$(elapsed_since "${t0}")"
     log_ok "Vuln Scan module finished.  [${C_DIM}$(elapsed_since "${t0}")${C_RESET}]"
 }
@@ -1332,23 +1908,12 @@ module_vuln_scan() {
 # ══════════════════════════════════════════════════════════════════════════════
 # §16 ─ RUN METADATA JSON REPORT
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Writes a structured JSON file capturing the full run context:
-#   - Script version & author
-#   - Target domain
-#   - Start / end timestamps + total elapsed time
-#   - Exact asset counts for every module
-#   - List of modules that were executed in this session
-#
-# Output file: recon_<domain>/run_metadata.json
-# ──────────────────────────────────────────────────────────────────────────────
 write_run_metadata() {
     local end_ts; end_ts="$(date +%s)"
     local end_human; end_human="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
     local total_elapsed; total_elapsed="$(elapsed_since "${RUN_START_TS}")"
     local metadata_file="${OUTPUT_BASE_DIR}/run_metadata.json"
 
-    # Build a comma-separated list of modules that ran in this session
     local modules_run=()
     [[ "${RUN_RECON}" -eq 1 ]]        && modules_run+=("\"recon\"")
     [[ "${RUN_PORTSCAN}" -eq 1 ]]     && modules_run+=("\"portscan\"")
@@ -1377,16 +1942,17 @@ write_run_metadata() {
     "output_dir":    "${OUTPUT_BASE_DIR}"
   },
   "counts": {
-    "unique_subdomains":  ${META_COUNTS[subdomains]},
-    "open_ports":         ${META_COUNTS[ports]},
-    "alive_hosts":        ${META_COUNTS[alive_hosts]},
-    "screenshots":        ${META_COUNTS[screenshots]},
-    "historical_urls":    ${META_COUNTS[historical_urls]},
-    "js_files":           ${META_COUNTS[js_files]},
-    "secrets_found":      ${META_COUNTS[secrets]},
-    "hidden_params":      ${META_COUNTS[hidden_params]},
-    "vuln_findings":      ${META_COUNTS[vuln_findings]},
-    "fuzz_hits":          ${META_COUNTS[fuzz_hits]}
+    "unique_subdomains":    ${META_COUNTS[subdomains]},
+    "open_ports":           ${META_COUNTS[ports]},
+    "alive_hosts":          ${META_COUNTS[alive_hosts]},
+    "screenshots":          ${META_COUNTS[screenshots]},
+    "total_urls":           ${META_COUNTS[total_urls]},
+    "categorised_urls":     ${META_COUNTS[url_categories]},
+    "js_files":             ${META_COUNTS[js_files]},
+    "secrets_found":        ${META_COUNTS[secrets]},
+    "hidden_params":        ${META_COUNTS[hidden_params]},
+    "vuln_findings":        ${META_COUNTS[vuln_findings]},
+    "fuzz_hits":            ${META_COUNTS[fuzz_hits]}
   }
 }
 JSON
@@ -1404,32 +1970,32 @@ print_summary() {
     echo ""
     log_section "Reconnaissance Complete — Final Summary"
 
-    printf "  ${C_BOLD}%-30s${C_RESET} ${C_BCYAN}%s${C_RESET}\n" \
+    printf "  ${C_BOLD}%-32s${C_RESET} ${C_BCYAN}%s${C_RESET}\n" \
         "Target:"         "${TARGET_DOMAIN}"
-    printf "  ${C_BOLD}%-30s${C_RESET} ${C_BCYAN}%s${C_RESET}\n" \
+    printf "  ${C_BOLD}%-32s${C_RESET} ${C_BCYAN}%s${C_RESET}\n" \
         "Output Directory:" "${OUTPUT_BASE_DIR}/"
-    printf "  ${C_BOLD}%-30s${C_RESET} ${C_BCYAN}%s${C_RESET}\n" \
+    printf "  ${C_BOLD}%-32s${C_RESET} ${C_BCYAN}%s${C_RESET}\n" \
         "Total Elapsed:"   "${total_elapsed}"
     echo ""
 
-    # Asset count table
     local -A label_map=(
         [subdomains]="Unique Subdomains"
         [ports]="Open Ports (naabu)"
         [alive_hosts]="Alive HTTP Hosts"
         [screenshots]="Screenshots Taken"
-        [historical_urls]="Historical URLs"
+        [total_urls]="Total URLs Harvested"
+        [url_categories]="Categorised URL Entries"
         [js_files]="JS Files Found"
-        [secrets]="Secrets Detected"
+        [secrets]="Secret Findings (all tools)"
         [hidden_params]="Hidden Parameters"
         [fuzz_hits]="Fuzzing Hits"
-        [vuln_findings]="Vuln Findings"
+        [vuln_findings]="Vuln Findings (nuclei)"
     )
 
     local ordered_keys=(
         subdomains ports alive_hosts screenshots
-        historical_urls js_files secrets hidden_params
-        fuzz_hits vuln_findings
+        total_urls url_categories js_files
+        secrets hidden_params fuzz_hits vuln_findings
     )
 
     for key in "${ordered_keys[@]}"; do
@@ -1437,7 +2003,6 @@ print_summary() {
         local label="${label_map[$key]}"
         local colour="${C_CYAN}"
 
-        # Highlight non-zero security findings in yellow/red
         if [[ "${key}" == "secrets" || "${key}" == "hidden_params" || \
               "${key}" == "vuln_findings" ]] && [[ "${val}" -gt 0 ]]; then
             colour="${C_BRED}"
@@ -1445,7 +2010,7 @@ print_summary() {
             colour="${C_BGREEN}"
         fi
 
-        printf "  ${C_BOLD}%-30s${C_RESET} ${colour}%s${C_RESET}\n" \
+        printf "  ${C_BOLD}%-32s${C_RESET} ${colour}%s${C_RESET}\n" \
             "${label}:" "${val}"
     done
 
@@ -1454,9 +2019,8 @@ print_summary() {
     log_ok "All selected modules completed. Stay legal, stay ethical. Happy hunting! 🎯"
     echo ""
 
-    # Final rich notification summarising the entire run
     notify_module "Pipeline Complete" "✅ All modules finished" \
-        "Subdomains: ${META_COUNTS[subdomains]} | Alive: ${META_COUNTS[alive_hosts]} | Vulns: ${META_COUNTS[vuln_findings]} | Secrets: ${META_COUNTS[secrets]}" \
+        "Subdomains: ${META_COUNTS[subdomains]} | Alive: ${META_COUNTS[alive_hosts]} | URLs: ${META_COUNTS[total_urls]} | Vulns: ${META_COUNTS[vuln_findings]} | Secrets: ${META_COUNTS[secrets]}" \
         "${total_elapsed}"
 }
 
@@ -1475,7 +2039,7 @@ print_banner() {
 BANNER
     echo -e "${C_RESET}"
     echo -e "  ${C_BOLD}Tier-1 Bug Bounty Reconnaissance Framework${C_RESET}  ${C_DIM}v${SCRIPT_VERSION}${C_RESET}"
-    echo -e "  ${C_DIM}Author: ${C_BMAGENTA}${SCRIPT_AUTHOR}${C_RESET}  ${C_DIM}·  Passive · Active · Modular · Automated${C_RESET}"
+    echo -e "  ${C_DIM}Author: ${C_BMAGENTA}${SCRIPT_AUTHOR}${C_RESET}  ${C_DIM}·  30+ Tools · Passive · Active · Modular · Automated${C_RESET}"
     echo -e "${LOG_SEP}"
     echo ""
 }
@@ -1489,48 +2053,108 @@ ${C_BOLD}REQUIRED:${C_RESET}
   ${C_YELLOW}-d <domain>${C_RESET}   Target root domain  (e.g. target.com)
 
 ${C_BOLD}MODULES:${C_RESET}
-  ${C_YELLOW}-r${C_RESET}            Passive Recon       Subdomain enum → dedup → httpx live filter
-  ${C_YELLOW}-P${C_RESET}            Port Scan           naabu → discover non-standard web ports → httpx
-  ${C_YELLOW}-s${C_RESET}            Screenshots         gowitness visual recon on alive hosts
-  ${C_YELLOW}-f${C_RESET}            Fuzzing             ffuf directory fuzzing (requires -l)
-  ${C_YELLOW}-u${C_RESET}            URL Discovery       gau + waybackurls historical URL harvest
-  ${C_YELLOW}-j${C_RESET}            JS & Secrets        Extract JS URLs → trufflehog/nuclei secret scan
-  ${C_YELLOW}-p${C_RESET}            Hidden Params       arjun GET/POST parameter discovery
-  ${C_YELLOW}-v${C_RESET}            Vuln Scan           nuclei CVE/takeover/misconfig scanning
-  ${C_YELLOW}-a${C_RESET}            All Modules         Full pipeline in dependency order
+  ${C_YELLOW}-r${C_RESET}   Passive + Active Recon   subfinder/assetfinder/amass/findomain/chaos/
+               github-subdomains/crt.sh → puredns/dnsx brute → httpx
+  ${C_YELLOW}-P${C_RESET}   Port Scan                naabu (all ports -p -) + nmap service scan
+  ${C_YELLOW}-s${C_RESET}   Screenshots              gowitness visual recon on alive hosts
+  ${C_YELLOW}-f${C_RESET}   Fuzzing                  ffuf dir+vhost + feroxbuster deep scan (requires -l)
+  ${C_YELLOW}-u${C_RESET}   URL Discovery            10-source harvest → 14-category filtering
+  ${C_YELLOW}-j${C_RESET}   JS & Secrets             subjs/mantra/jsecret/jsleak/trufflehog/lazyegg
+  ${C_YELLOW}-p${C_RESET}   Hidden Params            arjun GET/POST + qsreplace FUZZ list
+  ${C_YELLOW}-v${C_RESET}   Vuln Scan                nuclei CVE/takeover/misconfig/exposure scanning
+  ${C_YELLOW}-a${C_RESET}   All Modules              Full pipeline in dependency order
 
 ${C_BOLD}OPTIONS:${C_RESET}
-  ${C_YELLOW}-l <wordlist>${C_RESET} Wordlist path       Required when using -f or -a
-  ${C_YELLOW}-n${C_RESET}            Notify              Rich Telegram/Discord webhook on module completion
-  ${C_YELLOW}-h${C_RESET}            Help                Show this screen
+  ${C_YELLOW}-l <wordlist>${C_RESET}   Wordlist path   Required for -f/-a; also used by -r (active brute)
+  ${C_YELLOW}-n${C_RESET}             Notify          Rich Telegram/Discord webhook on module completion
+  ${C_YELLOW}-h${C_RESET}             Help            Show this screen
+
+${C_BOLD}ENVIRONMENT VARIABLES (optional):${C_RESET}
+  PDCP_API_KEY        ProjectDiscovery chaos API key
+  GITHUB_TOKEN        GitHub token for github-subdomains
+  NUCLEI_TEMPLATES    Path to local nuclei-templates checkout
+  TELEGRAM_BOT_TOKEN  Override inline credential (for -n)
+  TELEGRAM_CHAT_ID    Override inline credential (for -n)
+  DISCORD_WEBHOOK_URL Override inline credential (for -n)
 
 ${C_BOLD}EXAMPLES:${C_RESET}
   ${C_CYAN}${SCRIPT_NAME} -d target.com -r -P${C_RESET}
-    → Passive recon + port scan (discover non-standard web services)
+    → Passive+active recon + full port scan
 
   ${C_CYAN}${SCRIPT_NAME} -d target.com -r -u -j -n${C_RESET}
-    → Recon + historical URLs + JS secret scan + notifications
+    → Recon + 10-source URL harvest + JS secret scan + notifications
 
   ${C_CYAN}${SCRIPT_NAME} -d target.com -a -l ~/wordlists/raft-large.txt -n${C_RESET}
-    → Full pipeline with fuzzing and rich notifications
+    → Full pipeline with brute-forcing, fuzzing, and rich notifications
 
 ${C_BOLD}OUTPUT STRUCTURE:${C_RESET}
   recon_<domain>/
-  ├── subdomains/    Raw + merged subdomain lists
-  ├── ports/         naabu port scan results
-  ├── urls/          Alive URL lists (standard + non-standard ports)
-  ├── screenshots/   gowitness captures + sqlite DB
-  ├── urldiscovery/  gau / waybackurls historical URLs
-  ├── js/            JS URLs + trufflehog/nuclei secret findings
-  ├── params/        arjun hidden parameter findings
-  ├── fuzzing/       ffuf per-host JSON output
-  ├── vulns/         nuclei findings (text + JSONL)
-  └── run_metadata.json  Full run report (timestamps, counts, modules)
+  ├── subdomains/
+  │   ├── subs_*.txt              Per-tool raw subdomain files
+  │   ├── active/                 puredns + dnsx brute-force results
+  │   └── all_subs.txt            Merged + deduplicated master list
+  ├── ports/
+  │   ├── naabu_all.txt           All open host:port pairs
+  │   ├── naabu_filtered.txt      Non-standard web ports
+  │   └── nmap_scan.*             nmap XML/greppable/text output
+  ├── urls/
+  │   ├── alive_hosts.txt         httpx full output (status/title/tech)
+  │   ├── alive_urls.txt          Plain URL list for downstream tools
+  │   └── alive_nonstandard.txt   Alive hosts on non-standard ports
+  ├── screenshots/                gowitness captures + sqlite DB
+  ├── urldiscovery/
+  │   ├── *_raw.txt               Per-tool raw URL output
+  │   ├── all_urls_raw.txt        Merged raw URLs
+  │   ├── all_urls_clean.txt      Deduplicated, filtered master URL list
+  │   ├── urls_params.txt         URLs containing query parameters
+  │   ├── live_urls.txt           httpx-confirmed live URLs
+  │   └── categories/             14 category-filtered URL subsets
+  │       ├── js_urls.txt         JS file URLs
+  │       ├── php_files.txt       PHP endpoints
+  │       ├── asp_files.txt       ASP/ASPX endpoints
+  │       ├── api_endpoints.txt   JSON/XML/GraphQL endpoints
+  │       ├── login_flows.txt     Auth-related endpoints
+  │       ├── admin_panels.txt    Admin/management endpoints
+  │       ├── sensitive_files.txt .env/.bak/.sql/config files
+  │       ├── idor_targets.txt    Numeric ID patterns
+  │       ├── interesting.txt     High-value redirect/debug endpoints
+  │       ├── cloud_leaks.txt     AWS/GCP/Azure references
+  │       ├── injection_params.txt URLs with query parameters
+  │       └── wayback_sensitive.txt Sensitive extension matches
+  ├── js/
+  │   ├── js_urls.txt             Master JS URL list
+  │   ├── subjs_found.txt         Additional JS found by subjs
+  │   ├── mantra_secrets.txt      mantra pattern findings
+  │   ├── jsecret_output.txt      jsecret findings
+  │   ├── jsleak_output.txt       jsleak parallel findings
+  │   ├── regex_secrets.txt       Regex grep findings
+  │   ├── lazyegg_output.txt      lazyegg extraction
+  │   ├── trufflehog_findings.json trufflehog verified secrets
+  │   └── files/                  Downloaded .js content for local scan
+  ├── params/
+  │   ├── arjun_targets.txt       URLs submitted to arjun
+  │   ├── arjun_findings.json     arjun JSON output
+  │   ├── params_summary.txt      Human-readable param breakdown
+  │   ├── params_fuzz.txt         qsreplace FUZZ-ready URLs
+  │   └── param_keys.txt          Extracted parameter key names
+  ├── fuzzing/
+  │   ├── *_dir.json              ffuf per-host directory results
+  │   ├── *_ferox.txt             feroxbuster per-host results
+  │   └── vhost/                  VHost fuzzing results
+  │       ├── vhost_hostinject.json Host-header injection results
+  │       ├── sub_prefix_*.json    Subdomain prefix pattern results
+  │       └── *_403bypass.json     403 bypass header fuzzing results
+  ├── vulns/
+  │   ├── vuln_targets.txt        Enriched target list (alive + categories)
+  │   ├── nuclei_findings.txt     Human-readable findings
+  │   ├── nuclei_findings.json    JSONL machine-readable findings
+  │   └── nuclei_exposures.txt    Exposure-template output
+  └── run_metadata.json           Full run report (timestamps, counts, modules)
 
 ${C_BOLD}RESUME CAPABILITY:${C_RESET}
-  If a module was completed in a previous run, the script will detect the
-  completion stamp and ask whether to skip or re-run it. Non-interactive
-  sessions auto-skip completed modules.
+  Completed modules write a stamp file (.<module>.done).
+  On re-run, the script prompts to skip or re-execute each module.
+  Non-interactive sessions (piped stdin) auto-skip completed modules.
 
 EOF
 }
@@ -1545,10 +2169,6 @@ parse_args() {
         exit 0
     fi
 
-    # Option string explained:
-    #   d: → takes argument (domain)
-    #   l: → takes argument (wordlist)
-    #   r P s f u j p v a n h → boolean flags
     while getopts ":d:l:rPsfujpvanh" opt; do
         case "${opt}" in
             d)  TARGET_DOMAIN="${OPTARG}" ;;
@@ -1585,23 +2205,26 @@ parse_args() {
 
     shift $(( OPTIND - 1 ))
 
-    # ── Post-parse validation ──────────────────────────────────────────────────
     [[ -z "${TARGET_DOMAIN}" ]] && \
         die "Target domain (-d) is required." 2
 
     validate_domain "${TARGET_DOMAIN}"
 
-    # Fuzzing requires a wordlist — validate early before any disk work
+    # Fuzzing requires a wordlist
     if [[ "${RUN_FUZZING}" -eq 1 && -z "${WORDLIST_FILE}" ]]; then
-        die "The Fuzzing module (-f / -a) requires a wordlist. Provide one with -l <path>." 2
+        die "The Fuzzing module (-f / -a) requires a wordlist (-l <path>)." 2
     fi
 
-    # At least one module flag must be set
+    # Validate wordlist path if provided
+    if [[ -n "${WORDLIST_FILE}" ]]; then
+        validate_file "${WORDLIST_FILE}" "wordlist"
+    fi
+
     local any_module=$(( RUN_RECON + RUN_PORTSCAN + RUN_SCREENSHOTS + \
                          RUN_FUZZING + RUN_URLDISCOVERY + RUN_JSSECRETS + \
                          RUN_HIDDENPARAMS + RUN_VULN ))
     if [[ "${any_module}" -eq 0 ]]; then
-        die "No module selected. Use -r -P -s -f -u -j -p -v or -a. See -h for help." 2
+        die "No module selected. Use -r -P -s -f -u -j -p -v or -a. See -h." 2
     fi
 }
 
@@ -1612,7 +2235,6 @@ main() {
     parse_args "$@"
     print_banner
 
-    # ── Print session header ───────────────────────────────────────────────────
     echo -e "  ${LOG_INFO} ${C_BOLD}Target   :${C_RESET}  ${C_BCYAN}${TARGET_DOMAIN}${C_RESET}"
     [[ -n "${WORDLIST_FILE}" ]] && \
         echo -e "  ${LOG_INFO} ${C_BOLD}Wordlist :${C_RESET}  ${C_WHITE}${WORDLIST_FILE}${C_RESET}"
@@ -1632,16 +2254,15 @@ main() {
     echo -e "  ${LOG_INFO} ${C_BOLD}Started  :${C_RESET}  ${C_DIM}${RUN_START_HUMAN}${C_RESET}"
     echo ""
 
-    # ── Setup output directory tree ────────────────────────────────────────────
+    # Show tool availability before any disk work
+    preflight_tool_check
+
+    # Initialise output directory tree
     setup_output_dirs
 
     # ── Module pipeline dispatch ───────────────────────────────────────────────
     # Dependency order: recon → portscan → screenshots → url_discovery
     #                   → js_secrets → hidden_params → fuzzing → vuln_scan
-    #
-    # Each module checks for its own prerequisite files and logs a warning
-    # (not an error) if they're missing, allowing partial runs to work.
-
     [[ "${RUN_RECON}" -eq 1 ]]        && module_recon
     [[ "${RUN_PORTSCAN}" -eq 1 ]]     && module_portscan
     [[ "${RUN_SCREENSHOTS}" -eq 1 ]]  && module_screenshots
@@ -1651,7 +2272,6 @@ main() {
     [[ "${RUN_FUZZING}" -eq 1 ]]      && module_fuzzing
     [[ "${RUN_VULN}" -eq 1 ]]         && module_vuln_scan
 
-    # ── Finalise ───────────────────────────────────────────────────────────────
     write_run_metadata
     print_summary
 }
